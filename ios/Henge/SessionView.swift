@@ -33,6 +33,7 @@ struct SessionView: View {
     @State private var map: UIImage?
     @State private var zoomFollowing: Task<Void, Never>?
     @State private var helperRunning = false
+    @State private var pixelScrollReady = false
     @State private var shown = CGSize(width: 0.5, height: 0.5) // how much of the Mac's screen the zoomed view shows
     @Environment(\.scenePhase) private var scenePhase
 
@@ -390,13 +391,18 @@ struct SessionView: View {
                     Toggle("Sharp edges", isOn: $sharpCursor)
                     LabeledContent("Scroll speed", value: String(format: "%.1f×", scrollSpeed))
                     Slider(value: $scrollSpeed, in: 0.1...1.5)
+                    LabeledContent("Smooth trackpad scrolling", value: pixelScrollReady ? "On" : "Needs Mac helper")
+                    if !pixelScrollReady {
+                        Text("Use the setup command in Sharing below, then allow henge-agent in macOS System Settings → Privacy & Security → Accessibility. Until then, scrolling uses a limited mouse wheel fallback.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                     Text("The Mac supplies a small pointer image. Enlarging it can look blurry; 1× is the sharpest on an iPad. Scroll speed changes apply immediately.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Sharing") {
                     LabeledContent("Clipboard and folder", value: helperRunning ? "On" : "Not set up")
-                    if !helperRunning {
-                        Button("Type the Set Up Command") {
+                    if !helperRunning || !pixelScrollReady {
+                        Button(helperRunning ? "Type the Helper Update Command" : "Type the Set Up Command") {
                             showDetails = false
                             Task {
                                 try? await Task.sleep(nanoseconds: 600_000_000)
@@ -470,6 +476,7 @@ struct SessionView: View {
             framesOut = henge_vm_net_frames(1)
             framesIn = henge_vm_net_frames(0)
             helperRunning = Sharing.helperRunning
+            pixelScrollReady = henge_vm_pixel_scroll_ready() != 0
             log = Array(HengeLog.recentLines(200))
             let heat = ProcessInfo.processInfo.thermalState
             if heat.rawValue != thermalState.rawValue {

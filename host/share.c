@@ -46,6 +46,42 @@ static unsigned long device_seq;
 static char *guest_clip; /* the guest's, until the device takes it */
 static time_t agent_seen;
 
+static pthread_mutex_t scroll_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t scroll_cond = PTHREAD_COND_INITIALIZER;
+static int scroll_x, scroll_y, scroll_active;
+static unsigned long scroll_client;
+static int64_t scroll_seen_ms, scroll_motion_ms;
+
+static int64_t monotonic_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+int hv_share_scroll_ready(void) {
+    pthread_mutex_lock(&scroll_mu);
+    int ready = scroll_active && monotonic_ms() - scroll_seen_ms < 2000;
+    pthread_mutex_unlock(&scroll_mu);
+    return ready;
+}
+
+int hv_share_scroll_pixels(int dx, int dy) {
+    pthread_mutex_lock(&scroll_mu);
+    int64_t now = monotonic_ms();
+    int ready = scroll_active && now - scroll_seen_ms < 2000;
+    if (ready) {
+        if (now - scroll_motion_ms > 100) scroll_x = scroll_y = 0;
+        /* Never turn a stalled guest into a backlog of scrolling after the finger stops. */
+        int64_t x = (int64_t)scroll_x + dx, y = (int64_t)scroll_y + dy;
+        scroll_x = x < -128 ? -128 : x > 128 ? 128 : (int)x;
+        scroll_y = y < -128 ? -128 : y > 128 ? 128 : (int)y;
+        scroll_motion_ms = now;
+        pthread_cond_signal(&scroll_cond);
+    }
+    pthread_mutex_unlock(&scroll_mu);
+    return ready;
+}
+
 void hv_share_set_clipboard(const char *text) {
     pthread_mutex_lock(&clip_mu);
     free(device_clip);
@@ -656,6 +692,46 @@ static int clipboard_put(Conn *c, Request *r) {
     return respond_empty(c, r, 204, "No Content");
 }
 
+/* One persistent connection: a new TCP/HTTP connection for every pad event is too costly. */
+static int scroll_stream(Conn *c, Request *r) {
+    if (body_discard(c, r) != 0) return -1;
+    static const char headers[] = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n";
+    if (send_all(c->fd, headers, sizeof headers - 1) != 0) return -1;
+    pthread_mutex_lock(&scroll_mu);
+    unsigned long client = ++scroll_client;
+    scroll_x = scroll_y = 0;
+    scroll_seen_ms = monotonic_ms();
+    scroll_active = 1;
+    pthread_cond_broadcast(&scroll_cond);
+    pthread_mutex_unlock(&scroll_mu);
+    int rc = 0;
+    for (;;) {
+        struct timeval now;
+        gettimeofday(&now, NULL);
+        struct timespec until = {.tv_sec = now.tv_sec + 1, .tv_nsec = now.tv_usec * 1000};
+        pthread_mutex_lock(&scroll_mu);
+        while (client == scroll_client && !scroll_x && !scroll_y) {
+            if (pthread_cond_timedwait(&scroll_cond, &scroll_mu, &until) == ETIMEDOUT) break;
+        }
+        if (client != scroll_client) { pthread_mutex_unlock(&scroll_mu); break; }
+        int x = scroll_x, y = scroll_y;
+        if (monotonic_ms() - scroll_motion_ms > 100) x = y = 0;
+        scroll_x = scroll_y = 0;
+        pthread_mutex_unlock(&scroll_mu);
+        char line[64];
+        int n = snprintf(line, sizeof line, "%d %d\n", x, y);
+        if ((rc = send_all(c->fd, line, (size_t)n)) != 0) break;
+        pthread_mutex_lock(&scroll_mu);
+        if (client == scroll_client) scroll_seen_ms = monotonic_ms();
+        pthread_mutex_unlock(&scroll_mu);
+    }
+    pthread_mutex_lock(&scroll_mu);
+    if (client == scroll_client) { scroll_active = 0; scroll_x = scroll_y = 0; }
+    pthread_mutex_unlock(&scroll_mu);
+    r->close = 1;
+    return rc;
+}
+
 static int serve_henge(Conn *c, Request *r) {
     const char *what = r->path + strlen("/.henge/");
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
@@ -665,6 +741,7 @@ static int serve_henge(Conn *c, Request *r) {
     if (!strcmp(what, "agent") && !strcmp(r->method, "GET")) return serve_agent(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "GET")) return clipboard_get(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "PUT")) return clipboard_put(c, r);
+    if (!strcmp(what, "scroll") && !strcmp(r->method, "GET")) return scroll_stream(c, r);
     if (body_discard(c, r) != 0) return -1;
     return respond_empty(c, r, 404, "Not Found");
 }

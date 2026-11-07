@@ -15,5 +15,8 @@ void hv_share_set_clipboard(const char *text);
 char *hv_share_take_clipboard(void);
 /* Seconds since the helper in macOS was last heard from, or -1 if it never has been. */
 long hv_share_agent_seen(void);
+/* Precise scroll stream consumed by the guest helper after Accessibility is granted. */
+int hv_share_scroll_ready(void);
+int hv_share_scroll_pixels(int dx, int dy);
 
 #endif

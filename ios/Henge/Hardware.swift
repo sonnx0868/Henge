@@ -129,13 +129,29 @@ final class HardwareMouse {
     private var reverse = false
     private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
     private var lastScrollFirst: Float = 0, lastScrollSecond: Float = 0
+    private var scrollMotion = ScrollMotion()
+    private var scrollFlush: DispatchWorkItem?
+    private var lastScrollTime: TimeInterval = 0, lastWheelTime: TimeInterval = 0
+    private var fallbackX: Float = 0, fallbackY: Float = 0
+    private var scrollFramesLogged = 0
+    private var scrollDiagnostics = false
+    private var running = false
 
     func start() {
+        running = true
         let defaults = UserDefaults.standard
         speed = defaults.object(forKey: Self.speedKey) == nil ? 1 : Float(defaults.double(forKey: Self.speedKey))
         reverse = defaults.bool(forKey: Self.reverseKey)
         lastScrollFirst = 0
         lastScrollSecond = 0
+        scrollFlush?.cancel()
+        scrollFlush = nil
+        scrollMotion = ScrollMotion()
+        lastScrollTime = 0
+        lastWheelTime = 0
+        fallbackX = 0
+        fallbackY = 0
+        scrollDiagnostics = defaults.bool(forKey: "henge.performanceDiagnostics")
         GCMouse.mice().forEach(attach)
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] note in
             if let mouse = note.object as? GCMouse { self?.attach(mouse) }
@@ -153,6 +169,10 @@ final class HardwareMouse {
     }
 
     func stop() {
+        running = false
+        scrollFlush?.cancel()
+        scrollFlush = nil
+        scrollMotion = ScrollMotion()
         PointerLock.set(false)
         releaseButtons()
         observers.forEach(NotificationCenter.default.removeObserver)
@@ -181,7 +201,9 @@ final class HardwareMouse {
         input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(0, pressed) }
         input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(1, pressed) }
         input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(2, pressed) }
-        input.scroll.valueChangedHandler = { [weak self] _, first, second in self?.scrolled(first, second) }
+        input.scroll.valueChangedHandler = { [weak self] _, first, second in
+            DispatchQueue.main.async { self?.scrolled(first, second) }
+        }
     }
 
     /// GameController's Y runs upward. What doesn't make a whole step yet waits for the next move.
@@ -206,9 +228,9 @@ final class HardwareMouse {
     }
 
     /// GameController puts vertical motion on the first axis and horizontal on the second.
-    /// The Magic Keyboard sends many callbacks per gesture. Keep the callbacks
-    /// in step with the finger while limiting each wheel event's macOS acceleration.
+    /// Coalesce high-resolution pad callbacks before delivering a display frame.
     private func scrolled(_ first: Float, _ second: Float) {
+        guard running else { return }
         // GameController reports both axis states when either one changes. On a
         // Magic Keyboard it calls us twice per movement, with one stale axis in
         // each call; sending both values doubles the scroll and adds sideways drift.
@@ -220,26 +242,63 @@ final class HardwareMouse {
         let mostlyHorizontal = abs(second) > 2 * abs(first)
         let verticalRaw = verticalChanged && !mostlyHorizontal ? -first : 0
         let horizontalRaw = horizontalChanged && !mostlyVertical ? second : 0
+        guard verticalRaw != 0 || horizontalRaw != 0 else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastScrollTime > 0.12 {
+            scrollMotion = ScrollMotion()
+            fallbackX = 0
+            fallbackY = 0
+            scrollsLogged = 0
+            scrollFramesLogged = 0
+        }
+        lastScrollTime = now
+        scrollMotion.append(x: horizontalRaw, y: verticalRaw)
+        if scrollDiagnostics && scrollsLogged < 24 {
+            scrollsLogged += 1
+            HengeLog.log("input", "scroll raw: \(first), \(second); coalesced for pixel delivery")
+        }
+        guard scrollFlush == nil else { return }
+        let work = DispatchWorkItem { [weak self] in self?.flushScroll() }
+        scrollFlush = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60, execute: work)
+    }
+
+    private func flushScroll() {
+        scrollFlush = nil
+        guard running else { return }
         let defaults = UserDefaults.standard
         let configured = defaults.object(forKey: Self.scrollSpeedKey) == nil
             ? 0.3 : defaults.double(forKey: Self.scrollSpeedKey)
         let scale = Float(configured.isFinite ? min(max(configured, 0.1), 1.5) : 0.3)
         let way: Int32 = reverse ? -1 : 1
-        let horizontal = way * Self.wheelUnits(horizontalRaw, scale: scale)
-        let vertical = way * Self.wheelUnits(verticalRaw, scale: scale)
-        if scrollsLogged < 24 {
-            scrollsLogged += 1
-            HengeLog.log("input", "scroll raw: \(first), \(second); units: \(horizontal), \(vertical)")
+        let (x, y) = scrollMotion.takePixels(scale: scale)
+        let horizontal = way * x, vertical = way * y
+        guard horizontal != 0 || vertical != 0 else { return }
+        if henge_vm_mouse_scroll_pixels(horizontal, vertical) != 0 {
+            fallbackX = 0
+            fallbackY = 0
+            if scrollDiagnostics && scrollFramesLogged < 24 {
+                scrollFramesLogged += 1
+                HengeLog.log("input", "scroll frame pixels: \(horizontal), \(vertical); scale \(scale)")
+            }
+            return
         }
-        if horizontal != 0 || vertical != 0 { henge_vm_mouse_scroll(horizontal, vertical) }
-    }
-
-    private static func wheelUnits(_ value: Float, scale: Float) -> Int32 {
-        guard value.isFinite else { return 0 }
-        // A light gesture in the iPad14,6 log sent 24 events in 190 ms. At the
-        // default speed this yields ~7 units/event instead of ~13; the guest's
-        // measured wheel response is roughly proportional to units squared.
-        let units = Int32(min(16, (12 * scale * abs(value).squareRoot()).rounded()))
-        return value < 0 ? -units : units
+        // Until the helper is ready, never feed a high-rate pad into the guest's
+        // accelerated coarse wheel: at most one notch per axis every 50 ms.
+        fallbackX = min(max(fallbackX + Float(horizontal), -8), 8)
+        fallbackY = min(max(fallbackY + Float(vertical), -8), 8)
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastWheelTime >= 0.05 else { return }
+        let dx: Int32 = abs(fallbackX) >= 4 ? (fallbackX < 0 ? -1 : 1) : 0
+        let dy: Int32 = abs(fallbackY) >= 4 ? (fallbackY < 0 ? -1 : 1) : 0
+        guard dx != 0 || dy != 0 else { return }
+        fallbackX -= Float(dx) * 4
+        fallbackY -= Float(dy) * 4
+        lastWheelTime = now
+        henge_vm_mouse_scroll(dx, dy)
+        if scrollDiagnostics && scrollFramesLogged < 24 {
+            scrollFramesLogged += 1
+            HengeLog.log("input", "scroll frame wheel fallback: \(dx), \(dy); scale \(scale)")
+        }
     }
 }

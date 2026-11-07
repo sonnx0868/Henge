@@ -13,8 +13,9 @@ HUSK_REV=afe83d45b31194c4cc9f7b3db7ec2c757db8346e
 cd "$HENGE_ROOT"
 # The native-vs-JIT harness keeps multi-megabyte HvCpu copies on the main stack.
 ulimit -s 65520
-make build/test_code_links build/test_jit build/test_mem build/test_mmu
-for test in test_code_links test_jit test_mem test_mmu; do
+make build/test_code_links build/test_jit build/test_mem build/test_mmu build/test_scroll_bridge
+swiftc -parse-as-library ios/Henge/ScrollMotion.swift tests/test_scroll_motion.swift -o build/test_scroll_motion
+for test in test_code_links test_jit test_mem test_mmu test_scroll_bridge test_scroll_motion; do
     printf 'Running %s\n' "$test"
     if "build/$test"; then
         continue
