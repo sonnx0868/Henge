@@ -57,9 +57,14 @@ enum JITBootstrap {
     // 512 MiB since the native runtime runs Minecraft: its main library alone is a 354 MiB image that has to sit in this
     // region, with the stubs the loader places beside it. A larger prewarm is safe for QEMU, which is handed the
     // prewarmed region whenever it is at least what tb-size asks for.
-    /// The one region HengeVM's translator gets for the whole session (it flushes and starts over when full,
-    /// never asks for more). 1 GB takes about 1.5 s to prepare, and a first boot through Setup makes that much code; a full flush drops all of it.
-    static let jitBytes = 1024 * 1024 * 1024
+    /// On the 16 GB iPad Pro M2, a 1 GB cache filled about every 30 seconds in a browser session.
+    /// Request 2 GB there; the native prewarm retries the known working 1 GB size if StikDebug cannot provide it.
+    static let baselineJitBytes = 1024 * 1024 * 1024
+    static let jitBytes: Int = {
+        let has16GB = ProcessInfo.processInfo.physicalMemory >= 15 * 1024 * 1024 * 1024
+        return HengeLog.deviceModel == "iPad14,6" && has16GB ? 2 * baselineJitBytes : baselineJitBytes
+    }()
+    static var activeJitBytes: Int { Int(henge_ios_jit_region_size()) }
 
     /// True once the region is held. The memory budget needs this: after a
     /// prewarm the JIT is already counted in the footprint, so subtracting it
@@ -113,7 +118,7 @@ enum JITBootstrap {
         HengeLog.log("jit", "claiming \(jitBytes / (1024 * 1024)) MiB of JIT memory now, "
                          + "before the guest download -- StikDebug does not stay attached")
         prepareCompressedHeap()
-        let ok = henge_ios_jit_prewarm(jitBytes)
+        let ok = henge_ios_jit_prewarm_with_fallback(jitBytes, jitBytes > baselineJitBytes ? baselineJitBytes : 0)
         if !ok { releaseUnusedCompressedHeap() }
         if ok {
             prewarmed = true
@@ -134,7 +139,7 @@ enum JITBootstrap {
                         + "claimed. This is what happens when Henge runs inside "
                         + "another container app rather than sideloaded on its own."
         }
-        HengeLog.log("jit", ok ? "JIT region secured; it will be handed to QEMU later"
+        HengeLog.log("jit", ok ? "JIT region secured (\(activeJitBytes >> 20) MiB); it will be handed to QEMU later"
                               : "JIT prewarm FAILED -- StikDebug is not servicing traps")
         return ok
     }

@@ -20,7 +20,7 @@ struct SettingsView: View {
                         .font(.footnote).foregroundStyle(.secondary)
                     Button("Set up JIT") { jit.showSetup = true }
                     Toggle("Turn on JIT when Henge opens", isOn: $jitAtLaunch)
-                    LabeledContent("Code region", value: "\(JITBootstrap.jitBytes >> 20) MB, claimed once per launch")
+                    LabeledContent("Code region", value: "\((JITBootstrap.activeJitBytes > 0 ? JITBootstrap.activeJitBytes : JITBootstrap.jitBytes) >> 20) MB, claimed once per launch")
                 }
                 .listRowBackground(Desk.card)
                 Section("Memory") {
