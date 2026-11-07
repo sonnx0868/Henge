@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_code_links $(B)/test_scroll_bridge $(B)/test_jit_script $(B)/test_scroll_pixels $(B)/test_pvg_video_layout $(B)/test_pvg_present
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_code_links $(B)/test_scroll_bridge $(B)/test_jit_script $(B)/test_scroll_pixels $(B)/test_pvg_video_layout $(B)/test_pvg_present $(B)/test_pvg_queue
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -95,6 +95,8 @@ $(B)/test_pvg_video_layout: tests/test_pvg_video_layout.c devices/pvg_video_layo
 	$(CC) $(CFLAGS) tests/test_pvg_video_layout.c -o $@
 $(B)/test_pvg_present: tests/test_pvg_present.m devices/pvg_metal.m devices/*.h | $(B)
 	$(CC) $(CFLAGS) -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations $< $(METAL_LIBS) -o $@
+$(B)/test_pvg_queue: tests/test_pvg_queue.c devices/pvg_lite.c devices/*.h core/*.h | $(B)
+	$(CC) $(CFLAGS) $< -o $@
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@

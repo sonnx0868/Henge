@@ -57,6 +57,7 @@ struct HvPvgLite {
     uint32_t draining;
     uint32_t barrier_waits[MAX_CHANNELS];
     uint64_t barriers, barrier_drains, barrier_retries, barrier_timeouts;
+    uint64_t poll_recoveries;
     void *layer; /* where frames go, once there is a replay */
     uint32_t task_root[512]; /* page of each task's root, by the id in commands */
     uint64_t task_objects[512], task_placement[512]; /* task offsets of its object lists */
@@ -585,16 +586,33 @@ static void do_mapper(HvPvgLite *p) {
     hv_gicv3_pend(p->gic, p->iosfc_irq);
 }
 
-/* Device work no doorbell took care of: a channel that had to wait for another one's work. */
+/* Channel producers can publish another batch while an earlier doorbell is
+   being drained. Check the shared producer pointers on the regular device
+   tick as well as retrying dependency waits: progress must not depend on a
+   later input event causing the guest to submit/notify more GPU work. */
 void hv_pvg_lite_poll(HvPvgLite *p) {
     if (!p) return;
     uint32_t chans = p->chan_pending;
-    if (chans) {
-        p->chan_pending = 0;
-        for (uint32_t ch = 1; ch < MAX_CHANNELS; ch++)
-            if (chans & (1u << ch)) do_channel(p, ch);
-        if (__atomic_load_n(&p->status, __ATOMIC_ACQUIRE)) hv_gicv3_pend(p->gic, p->gfx_irq);
+    p->chan_pending = 0;
+    uint64_t root = (uint64_t)reg(p, 0x101c) << 14;
+    int serviced = 0;
+    for (uint32_t ch = 1; ch < MAX_CHANNELS; ch++) {
+        uint32_t *rec = root ? hv_phys_ptr(p->m, root + 0x400 + 0x14 * (ch - 1), 0x14) : NULL;
+        uint32_t wr = rec ? __atomic_load_n(&rec[0], __ATOMIC_ACQUIRE) : 0;
+        uint32_t rd = rec ? __atomic_load_n(&rec[1], __ATOMIC_RELAXED) : 0;
+        int queued = rec && rec[4] && wr != rd;
+        if (!(chans & (1u << ch)) && !queued) continue;
+        if (queued && !(chans & (1u << ch))) {
+            uint64_t n = ++p->poll_recoveries;
+            /* First cases and powers of two give evidence without per-frame logging. */
+            if (n <= 8 || !(n & (n - 1)))
+                fprintf(stderr, "hengevm: pvg-lite: poll recovered queued work ch %u rd %x wr %x submitted %x; total %llu\n",
+                        ch, rd, wr, p->submitted[ch], (unsigned long long)n);
+        }
+        do_channel(p, ch);
+        serviced = 1;
     }
+    if (serviced && __atomic_load_n(&p->status, __ATOMIC_ACQUIRE)) hv_gicv3_pend(p->gic, p->gfx_irq);
 }
 
 static uint64_t gfx_read(void *opaque, uint64_t off, unsigned size) {
