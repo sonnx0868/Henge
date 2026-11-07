@@ -13,7 +13,14 @@ HUSK_REV=afe83d45b31194c4cc9f7b3db7ec2c757db8346e
 cd "$HENGE_ROOT"
 make build/test_code_links build/test_jit build/test_mem build/test_mmu
 for test in test_code_links test_jit test_mem test_mmu; do
-    "build/$test"
+    printf 'Running %s\n' "$test"
+    if "build/$test"; then
+        continue
+    else
+        result=$?
+        lldb --batch -o run -o 'thread backtrace all' -- "build/$test" || true
+        exit "$result"
+    fi
 done
 
 missing=()
