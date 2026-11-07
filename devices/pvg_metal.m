@@ -158,6 +158,8 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     id<MTLSamplerState> screen_sampler, cursor_sampler;
     uint64_t on_screen; /* the mapping showing */
     uint64_t gpu_frames;
+    uint64_t screen_swaps;
+    _Atomic uint64_t gpu_redraws;
     dispatch_queue_t presenter;
     os_unfair_lock screen_lock; /* what to show, and the pointer as the presenter reads it */
     id<MTLTexture> screen_tex;
@@ -172,6 +174,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
 - (void)complain:(NSString *)what;
 - (HvObject *)object:(uint32_t)ref task:(uint32_t)task;
 - (void)drawCursor;
+- (void)screenChanged;
 @end
 
 /* What Metal asks while it reads a serialized pipeline. */
@@ -886,7 +889,7 @@ static BOOL has_guest_pages(HvObject *o) {
     }
     [blit endEncoding];
     if (cb) {
-        [self commit:cb channel:0 stamp:0 complete:NO];
+        [self commit:cb channel:0 stamp:0 complete:NO redraw:NO];
         synced++;
     }
 }
@@ -1611,7 +1614,7 @@ typedef struct {
 
 /* One exec: {task, resources, buffers}, {ref, flags} per resource, {offset, length} per buffer. */
 /* Commits without waiting: the next batch can be encoded while the GPU does this one. */
-- (void)commit:(id<MTLCommandBuffer>)cb channel:(uint32_t)ch stamp:(uint32_t)stamp complete:(BOOL)complete {
+- (void)commit:(id<MTLCommandBuffer>)cb channel:(uint32_t)ch stamp:(uint32_t)stamp complete:(BOOL)complete redraw:(BOOL)redraw {
     static int sync = -1; /* HV_PVG_SYNC: wait for the GPU after every batch */
     if (sync < 0) sync = getenv("HV_PVG_SYNC") != NULL;
     HvPvgLite *l = lite;
@@ -1620,6 +1623,16 @@ typedef struct {
         if (done.error) {
             self->failed++;
             fprintf(stderr, "hengevm: pvg-metal: command buffer: %s\n", done.error.localizedDescription.UTF8String);
+        }
+        /* A guest exec can update the currently scanned-out buffer in place,
+           without another display swap. A cursor move used to be the only way
+           to show those new pixels once the presenter went idle. Wake it after
+           the writes finish, independently of input. Only guest execs request
+           this: empty stamp fences and the presenter's own CB never do, so an
+           idle desktop cannot turn into a self-sustaining redraw loop. */
+        if (redraw && !done.error) {
+            atomic_fetch_add(&self->gpu_redraws, 1);
+            [self screenChanged];
         }
         if (complete) hv_pvg_lite_complete(l, ch, stamp);
         atomic_fetch_sub(&self->inflight, 1);
@@ -1635,7 +1648,7 @@ typedef struct {
         hv_pvg_lite_complete(lite, ch, stamp);
         return;
     }
-    [self commit:[queue commandBuffer] channel:ch stamp:stamp complete:YES];
+    [self commit:[queue commandBuffer] channel:ch stamp:stamp complete:YES redraw:NO];
 }
 
 /* Returns YES if the GPU's completion gives the stamp back. */
@@ -1762,7 +1775,7 @@ typedef struct {
         [back endEncoding];
     }
     double t1 = now_seconds();
-    [self commit:cb channel:ch stamp:stamp complete:YES];
+    [self commit:cb channel:ch stamp:stamp complete:YES redraw:YES];
     double t2 = now_seconds();
     encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
     if (++execs % 2000 == 0) {
@@ -1772,6 +1785,8 @@ typedef struct {
         fprintf(stderr, "hengevm: video uploads %llu unchanged %llu fenced %llu copy failures %llu GPU fence wait %.3f s\n",
                 (unsigned long long)video_uploads, (unsigned long long)video_skips, (unsigned long long)video_fences,
                 (unsigned long long)video_copy_failures, video_wait_time);
+        fprintf(stderr, "hengevm: display swaps %llu GPU redraw completions %llu\n",
+                (unsigned long long)screen_swaps, (unsigned long long)atomic_load(&gpu_redraws));
         encode_time = gpu_wait_time = 0;
     }
     return YES;
@@ -1932,6 +1947,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     HvObject *surface = surfaces[@(mapping)];
     if (!surface) { [self complain:[NSString stringWithFormat:@"swap to unknown surface %llu", mapping]]; return; }
     on_screen = mapping;
+    screen_swaps++;
     BOOL half = surface->fourcc == 'RGhA';
     if (!screen_tex) fprintf(stderr, "hengevm: display scanout format %s (%ux%u)\n",
                              half ? "RGBA16Float" : "BGRA8Unorm", surface->surface_w, surface->surface_h);
