@@ -28,6 +28,23 @@ typedef struct HvPvgVideoPlane {
     uint64_t offset, stride, rows, row_bytes;
 } HvPvgVideoPlane;
 
+typedef struct HvPvgVideoPlaneView {
+    uint64_t width, height, bytes_per_element;
+} HvPvgVideoPlaneView;
+
+/* A single-channel Y view and a two-channel UV view can name the same
+   IOSurface mapping. Select its plane from the actual host layout, rather
+   than treating all mapped texture views as plane zero. A combined/private
+   YCbCr format supplies element_bytes=0 and keeps Metal's plane-zero path. */
+static inline int hv_pvg_video_view_plane(const HvPvgVideoPlaneView *planes, uint32_t count,
+                                         uint64_t width, uint64_t height, uint32_t element_bytes) {
+    if (!element_bytes) return 0;
+    for (uint32_t i = 0; i < count; i++)
+        if (planes[i].width == width && planes[i].height == height && planes[i].bytes_per_element == element_bytes)
+            return (int)i;
+    return -1;
+}
+
 static inline int hv_pvg_video_plane_valid(HvPvgVideoPlane p, uint64_t source_bytes,
                                           size_t destination_stride, size_t destination_rows) {
     if (!p.rows || p.rows > destination_rows || !p.row_bytes || p.row_bytes > p.stride ||

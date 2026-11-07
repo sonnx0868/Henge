@@ -49,6 +49,17 @@ int main(void) {
     CHECK(!hv_pvg_video_plane_valid(plane, 96, 16, 2), "short destination height rejected");
     plane.offset = UINT64_MAX;
     CHECK(!hv_pvg_video_plane_valid(plane, 96, 16, 3), "offset overflow rejected");
-    puts("PVG video: v1/v2 descriptor bounds, channel swizzles, row strides, padding and truncated planes passed");
+    /* Observed 420v video: 1620x1080 Y, 810x540 interleaved UV; both
+       planes have a 1664-byte row. Pixel format/geometry selects the plane,
+       not the shared mapping ID or equal row strides. */
+    HvPvgVideoPlaneView views[] = {{1620, 1080, 1}, {810, 540, 2}};
+    CHECK(hv_pvg_video_view_plane(views, 2, 1620, 1080, 1) == 0, "R8 luma uses plane zero");
+    CHECK(hv_pvg_video_view_plane(views, 2, 810, 540, 2) == 1, "RG8 chroma uses plane one, never luma bytes");
+    CHECK(hv_pvg_video_view_plane(views, 2, 1620, 1080, 0) == 0, "combined YCbCr view keeps Metal's plane-zero path");
+    CHECK(hv_pvg_video_view_plane(views, 2, 810, 540, 1) == -1, "mismatched channel layout is rejected");
+    HvPvgVideoPlaneView tenbit[] = {{3840, 2160, 2}, {1920, 1080, 4}};
+    CHECK(hv_pvg_video_view_plane(tenbit, 2, 3840, 2160, 2) == 0, "10-bit luma uses plane zero");
+    CHECK(hv_pvg_video_view_plane(tenbit, 2, 1920, 1080, 4) == 1, "10-bit interleaved chroma uses plane one");
+    puts("PVG video: descriptor bounds, strides, padding, truncation and separate 8/10-bit Y/UV texture views passed");
     return 0;
 }

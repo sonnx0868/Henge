@@ -44,9 +44,11 @@ void hv_pvg_lite_complete(HvPvgLite *p, uint32_t c, uint32_t s) { stamps++; }
 @interface TestReplay : HvReplay {
 @public
     unsigned displayed;
+    HvObject *resource;
 }
 @end
 @implementation TestReplay
+- (HvObject *)object:(uint32_t)ref task:(uint32_t)task { return ref == 1 ? resource : nil; }
 /* Keep the real dirty flag, lock and kickPresenter; replace only Metal drawing. */
 - (void)presentLoop {
     os_unfair_lock_lock(&screen_lock);
@@ -68,7 +70,10 @@ int main(void) {
         r->screen_lock = OS_UNFAIR_LOCK_INIT;
         /* A retained scanout exists; the test presenter does not sample it. */
         r->screen_tex = (id<MTLTexture>)[NSObject new];
-        uint32_t exec[3] = {0, 0, 0};
+        r->resource = [HvObject new];
+        r->resource->surface = [HvObject new];
+        r->resource->surface->scanout = r->screen_tex;
+        uint32_t exec[5] = {0, 1, 0, 1, 2}; /* one writable visible resource */
         for (unsigned i = 0; i < 3; i++) {
             q.next = [TestCB new];
             assert([r exec:exec length:sizeof exec channel:1 stamp:i]);
@@ -93,8 +98,19 @@ int main(void) {
         [q.next finish:YES];
         dispatch_sync(r->presenter, ^{});
         assert(r->displayed == 3 && stamps == 5);
+        /* Offscreen writes and read-only sampling of the visible surface
+           must not generate extra display frames. */
+        for (unsigned flags = 1; flags <= 2; flags++) {
+            q.next = [TestCB new];
+            exec[4] = flags;
+            if (flags == 2) r->resource->surface->scanout = nil;
+            assert([r exec:exec length:sizeof exec channel:1 stamp:6 + flags]);
+            [q.next finish:YES];
+            dispatch_sync(r->presenter, ^{});
+            assert(r->displayed == 3);
+        }
         assert(!r->screen_dirty && !r->presenter_running);
-        puts("PVG present: GPU completion wakes idle scanout without swaps/input; failed jobs and stamp fences do not redraw");
+        puts("PVG present: visible writes wake idle scanout; offscreen/read-only work, failed jobs and stamp fences do not redraw");
     }
     return 0;
 }

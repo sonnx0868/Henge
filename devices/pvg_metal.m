@@ -125,6 +125,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *mapped_textures;
     NSMutableDictionary<NSNumber *, HvObject *> *surfaces;
     NSMutableSet<NSString *> *complaints;
+    NSMutableSet<NSString *> *video_view_layouts;
     uint64_t execs, draws, failed, heap_bytes, synced, remaps;
     uint64_t video_uploads, video_skips, video_fences, video_copy_failures;
     double video_wait_time;
@@ -762,10 +763,30 @@ static void sync_iosurface(HvReplay *r, HvObject *s) {
     t.usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
     o->surface = surface;
     if (surface->iosurface) {
-        o->object = [device newTextureWithDescriptor:t iosurface:surface->iosurface plane:0];
+        uint32_t element_bytes = 0;
+        switch (t.pixelFormat) {
+        case MTLPixelFormatR8Unorm: element_bytes = 1; break;
+        case MTLPixelFormatRG8Unorm: case MTLPixelFormatR16Unorm: element_bytes = 2; break;
+        case MTLPixelFormatRG16Unorm: element_bytes = 4; break;
+        default: break; /* combined YCbCr textures, including private format 500 */
+        }
+        HvPvgVideoPlaneView views[4] = {0};
+        uint32_t count = (uint32_t)MIN(IOSurfaceGetPlaneCount(surface->iosurface), 4u);
+        for (uint32_t i = 0; i < count; i++)
+            views[i] = (HvPvgVideoPlaneView){IOSurfaceGetWidthOfPlane(surface->iosurface, i),
+                IOSurfaceGetHeightOfPlane(surface->iosurface, i), IOSurfaceGetBytesPerElementOfPlane(surface->iosurface, i)};
+        int plane = hv_pvg_video_view_plane(views, count, t.width, t.height, element_bytes);
+        NSString *layout = [NSString stringWithFormat:@"%08x:fmt%lu:%lux%lu:plane%d", surface->fourcc,
+                            (unsigned long)t.pixelFormat, (unsigned long)t.width, (unsigned long)t.height, plane];
+        if (video_view_layouts.count < 32 && ![video_view_layouts containsObject:layout]) {
+            [video_view_layouts addObject:layout];
+            fprintf(stderr, "hengevm: video texture view %s\n", layout.UTF8String);
+        }
+        if (plane < 0) { [self complain:[@"video texture view has no matching plane: " stringByAppendingString:layout]]; return; }
+        o->object = [device newTextureWithDescriptor:t iosurface:surface->iosurface plane:(NSUInteger)plane];
         if (!o->object) { /* video formats cannot be drawn into */
             t.usage = MTLTextureUsageShaderRead;
-            o->object = [device newTextureWithDescriptor:t iosurface:surface->iosurface plane:0];
+            o->object = [device newTextureWithDescriptor:t iosurface:surface->iosurface plane:(NSUInteger)plane];
         }
     }
     else o->object = [(id<MTLBuffer>)surface->object newTextureWithDescriptor:t offset:surface->first bytesPerRow:surface->row];
@@ -1627,7 +1648,7 @@ typedef struct {
         /* A guest exec can update the currently scanned-out buffer in place,
            without another display swap. A cursor move used to be the only way
            to show those new pixels once the presenter went idle. Wake it after
-           the writes finish, independently of input. Only guest execs request
+           the writes finish, independently of input. Only visible writes request
            this: empty stamp fences and the presenter's own CB never do, so an
            idle desktop cannot turn into a self-sustaining redraw loop. */
         if (redraw && !done.error) {
@@ -1666,12 +1687,22 @@ typedef struct {
     tracing = trace_file && access(trace_file, F_OK) == 0;
     if (tracing) fprintf(stderr, "trace: exec task %u, %u resources, %u buffers\n", task, nres, nbuf);
     double t_begin = now_seconds();
+    os_unfair_lock_lock(&screen_lock);
+    id<MTLTexture> visible = screen_tex;
+    os_unfair_lock_unlock(&screen_lock);
+    BOOL writes_visible = NO;
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = nil;
     BOOL sync_after = NO;
     for (uint32_t i = 0; i < nres; i++) {
         HvObject *o = [self object:res[i * 2] task:task];
         if (!o) continue;
+        if (visible && (res[i * 2 + 1] & 2)) {
+            for (HvObject *owner = o; owner; owner = owner->parent) {
+                HvObject *surface = owner->surface;
+                if ((surface && surface->scanout == visible) || owner->scanout == visible) writes_visible = YES;
+            }
+        }
         if (o->mapped) refresh_pages(self, task, o);
         if (o->surface) sync_iosurface(self, o->surface);
         if (getenv("HV_PVG_TALLY") && (o->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE) {
@@ -1775,7 +1806,7 @@ typedef struct {
         [back endEncoding];
     }
     double t1 = now_seconds();
-    [self commit:cb channel:ch stamp:stamp complete:YES redraw:YES];
+    [self commit:cb channel:ch stamp:stamp complete:YES redraw:writes_visible];
     double t2 = now_seconds();
     encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
     if (++execs % 2000 == 0) {
@@ -2173,6 +2204,7 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
         r->mapped_textures = [NSMutableDictionary new];
         r->surfaces = [NSMutableDictionary new];
         r->complaints = [NSMutableSet new];
+        r->video_view_layouts = [NSMutableSet new];
         r->shot = getenv("HV_PVG_SHOT");
 #if !TARGET_OS_IPHONE
         if (getenv("HV_PVG_GPU_TEST")) r->layer = [CAMetalLayer layer];
