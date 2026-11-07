@@ -9,6 +9,13 @@ HUSK_ROOT="$(dirname "$HENGE_ROOT")/Husk"
 STIKJIT_ROOT="$(dirname "$HENGE_ROOT")/StikJIT"
 HUSK_REV=afe83d45b31194c4cc9f7b3db7ec2c757db8346e
 
+# Exercise guest code changes and cache invalidation on the Mac build host before packaging iOS.
+cd "$HENGE_ROOT"
+make build/test_code_links build/test_jit build/test_mem build/test_mmu
+for test in test_code_links test_jit test_mem test_mmu; do
+    "build/$test"
+done
+
 missing=()
 for tool in meson ninja pkg-config xcodegen cmake; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
