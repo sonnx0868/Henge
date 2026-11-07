@@ -135,6 +135,9 @@ final class HardwareMouse {
     private var scrollFramesLogged = 0
     private var scrollDiagnostics = false
     private var running = false
+    private var secondaryClick = SecondaryClickRouting()
+    private var buttonLogs = [0, 0, 0]
+    private var uiKitButtonLogs = 0
 
     func start() {
         running = true
@@ -149,6 +152,9 @@ final class HardwareMouse {
         fallbackX = 0
         fallbackY = 0
         scrollDiagnostics = defaults.bool(forKey: "henge.performanceDiagnostics")
+        secondaryClick.reset()
+        buttonLogs = [0, 0, 0]
+        uiKitButtonLogs = 0
         GCMouse.mice().forEach(attach)
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] note in
             if let mouse = note.object as? GCMouse { self?.attach(mouse) }
@@ -190,16 +196,24 @@ final class HardwareMouse {
     func releaseButtons() {
         for button in buttonsDown { henge_vm_mouse_button(button, 0) }
         buttonsDown.removeAll()
+        secondaryClick.reset()
     }
 
     private func attach(_ mouse: GCMouse) {
         guard let input = mouse.mouseInput, !mice.contains(where: { $0 === mouse }) else { return }
         mice.append(mouse)
         HengeLog.log("input", "mouse: \(mouse.vendorName ?? "?"), right button \(input.rightButton != nil), middle \(input.middleButton != nil)")
+        let name = mouse.vendorName ?? "?"
         input.mouseMovedHandler = { [weak self] _, dx, dy in self?.moved(dx, dy) }
-        input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(0, pressed) }
-        input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(1, pressed) }
-        input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(2, pressed) }
+        input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
+            DispatchQueue.main.async { self?.button(0, pressed, device: name) }
+        }
+        input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in
+            DispatchQueue.main.async { self?.button(1, pressed, device: name) }
+        }
+        input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in
+            DispatchQueue.main.async { self?.button(2, pressed, device: name) }
+        }
         input.scroll.valueChangedHandler = nil
         // Each axis reports its own relative events. Comparing values to the
         // previous callback drops legitimate identical deltas during steady motion.
@@ -222,8 +236,36 @@ final class HardwareMouse {
         henge_vm_mouse_move(Int32(x), Int32(y))
     }
 
-    private func button(_ button: Int32, _ pressed: Bool) {
+    private func button(_ button: Int32, _ pressed: Bool, device: String) {
+        guard running, button >= 0, button < 3 else { return }
+        if scrollDiagnostics && buttonLogs[Int(button)] < 32 {
+            buttonLogs[Int(button)] += 1
+            HengeLog.log("input", "mouse button raw: controller \(device) button \(button) \(pressed ? "down" : "up")")
+        }
+        if button == 1 {
+            for down in secondaryClick.controller(pressed: pressed, now: ProcessInfo.processInfo.systemUptime) {
+                sendButton(button, down, source: "controller")
+            }
+        } else {
+            sendButton(button, pressed, source: "controller")
+        }
+    }
+
+    func secondaryClickFromUIKit() {
+        guard running else { return }
+        let events = secondaryClick.uiKitClick(now: ProcessInfo.processInfo.systemUptime)
+        if scrollDiagnostics && uiKitButtonLogs < 32 {
+            uiKitButtonLogs += 1
+            HengeLog.log("input", "mouse secondary UIKit: \(events.isEmpty ? "duplicate suppressed" : "forwarded")")
+        }
+        for down in events { sendButton(1, down, source: "UIKit") }
+    }
+
+    private func sendButton(_ button: Int32, _ pressed: Bool, source: String) {
         henge_vm_mouse_button(button, pressed ? 1 : 0)
+        if scrollDiagnostics && button == 1 {
+            HengeLog.log("input", "mouse button guest: \(source) secondary \(pressed ? "down" : "up")")
+        }
         if pressed {
             buttonsDown.insert(button)
         } else {

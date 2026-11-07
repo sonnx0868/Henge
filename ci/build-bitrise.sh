@@ -15,7 +15,8 @@ cd "$HENGE_ROOT"
 ulimit -s 65520
 make build/test_code_links build/test_jit build/test_mem build/test_mmu build/test_scroll_bridge build/test_jit_script build/test_scroll_pixels build/test_pvg_video_layout
 swiftc -parse-as-library ios/Henge/ScrollMotion.swift tests/test_scroll_motion.swift -o build/test_scroll_motion
-for test in test_code_links test_jit test_mem test_mmu test_scroll_bridge test_scroll_motion test_jit_script test_scroll_pixels test_pvg_video_layout; do
+swiftc -parse-as-library ios/Henge/SecondaryClickRouting.swift tests/test_secondary_click.swift -o build/test_secondary_click
+for test in test_code_links test_jit test_mem test_mmu test_scroll_bridge test_scroll_motion test_jit_script test_scroll_pixels test_pvg_video_layout test_secondary_click; do
     printf 'Running %s\n' "$test"
     if "build/$test"; then
         continue

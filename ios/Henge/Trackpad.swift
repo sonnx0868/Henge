@@ -9,7 +9,7 @@ struct Trackpad: UIViewRepresentable {
     func makeUIView(context: Context) -> Surface { Surface() }
     func updateUIView(_ view: Surface, context: Context) {}
 
-    final class Surface: UIView, UIPointerInteractionDelegate {
+    final class Surface: UIView, UIPointerInteractionDelegate, UIGestureRecognizerDelegate {
         private static let holdTime: TimeInterval = 0.4
         private static let tapTime: TimeInterval = 0.3
         private static let tapDistance: CGFloat = 8
@@ -30,6 +30,17 @@ struct Trackpad: UIViewRepresentable {
             isMultipleTouchEnabled = true
             backgroundColor = .clear
             addInteraction(UIPointerInteraction(delegate: self))
+            // Some iPad mice report secondary clicks to UIKit without a matching
+            // GameController button callback. Only secondary pointer taps use this
+            // fallback; fingers and primary-button motion keep their existing paths.
+            let secondary = UITapGestureRecognizer(target: self, action: #selector(secondaryPointerClick(_:)))
+            secondary.buttonMaskRequired = .secondary
+            secondary.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+            secondary.cancelsTouchesInView = false
+            secondary.delaysTouchesBegan = false
+            secondary.delaysTouchesEnded = false
+            secondary.delegate = self
+            addGestureRecognizer(secondary)
         }
 
         /// Over the Mac there is only the Mac's pointer, if iPadOS hasn't locked its own away.
@@ -39,6 +50,14 @@ struct Trackpad: UIViewRepresentable {
         private var speed: CGFloat { traitCollection.horizontalSizeClass == .regular ? 2 : 3 }
 
         required init?(coder: NSCoder) { fatalError("made in code") }
+
+        @objc private func secondaryPointerClick(_ gesture: UITapGestureRecognizer) {
+            guard gesture.state == .ended else { return }
+            HardwareMouse.shared.secondaryClickFromUIKit()
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
 
         override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
             let touches = touches.filter { $0.type != .indirectPointer }
