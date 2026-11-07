@@ -11,6 +11,8 @@ HUSK_REV=afe83d45b31194c4cc9f7b3db7ec2c757db8346e
 
 # Exercise guest code changes and cache invalidation on the Mac build host before packaging iOS.
 cd "$HENGE_ROOT"
+# The native-vs-JIT harness keeps multi-megabyte HvCpu copies on the main stack.
+ulimit -s 65520
 make build/test_code_links build/test_jit build/test_mem build/test_mmu
 for test in test_code_links test_jit test_mem test_mmu; do
     printf 'Running %s\n' "$test"
