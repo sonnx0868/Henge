@@ -129,6 +129,8 @@ final class HardwareMouse {
     private var reverse = false
     private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
     private var lastScrollFirst: Float = 0, lastScrollSecond: Float = 0
+    private var pendingWheelVertical: Float = 0, pendingWheelHorizontal: Float = 0
+    private var lastScrollTime: TimeInterval = 0
 
     func start() {
         let defaults = UserDefaults.standard
@@ -136,6 +138,9 @@ final class HardwareMouse {
         reverse = defaults.bool(forKey: Self.reverseKey)
         lastScrollFirst = 0
         lastScrollSecond = 0
+        pendingWheelVertical = 0
+        pendingWheelHorizontal = 0
+        lastScrollTime = 0
         GCMouse.mice().forEach(attach)
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] note in
             if let mouse = note.object as? GCMouse { self?.attach(mouse) }
@@ -206,9 +211,15 @@ final class HardwareMouse {
     }
 
     /// GameController puts vertical motion on the first axis and horizontal on the second.
-    /// macOS accelerates wheel units roughly quadratically, so use a tunable square root
-    /// and cap each event to keep a small pad gesture from jumping across a page.
+    /// The Magic Keyboard sends many axis callbacks per finger movement. A wheel unit
+    /// for every callback makes a short swipe travel thousands of pixels in macOS.
     private func scrolled(_ first: Float, _ second: Float) {
+        let now = ProcessInfo.processInfo.systemUptime
+        if now - lastScrollTime > 0.25 {
+            pendingWheelVertical = 0
+            pendingWheelHorizontal = 0
+        }
+        lastScrollTime = now
         // GameController reports both axis states when either one changes. On a
         // Magic Keyboard it calls us twice per movement, with one stale axis in
         // each call; sending both values doubles the scroll and adds sideways drift.
@@ -225,8 +236,8 @@ final class HardwareMouse {
             ? 0.3 : defaults.double(forKey: Self.scrollSpeedKey)
         let scale = Float(configured.isFinite ? min(max(configured, 0.1), 1.5) : 0.3)
         let way: Int32 = reverse ? -1 : 1
-        let horizontal = way * Self.wheelUnits(horizontalRaw, scale: scale)
-        let vertical = way * Self.wheelUnits(verticalRaw, scale: scale)
+        let horizontal = way * Self.wheelUnits(horizontalRaw, scale: scale, remainder: &pendingWheelHorizontal)
+        let vertical = way * Self.wheelUnits(verticalRaw, scale: scale, remainder: &pendingWheelVertical)
         if scrollsLogged < 24 {
             scrollsLogged += 1
             HengeLog.log("input", "scroll raw: \(first), \(second); units: \(horizontal), \(vertical)")
@@ -234,9 +245,13 @@ final class HardwareMouse {
         if horizontal != 0 || vertical != 0 { henge_vm_mouse_scroll(horizontal, vertical) }
     }
 
-    private static func wheelUnits(_ value: Float, scale: Float) -> Int32 {
+    private static func wheelUnits(_ value: Float, scale: Float, remainder: inout Float) -> Int32 {
         guard value.isFinite else { return 0 }
-        let units = Int32(min(32, (22 * scale * abs(value).squareRoot()).rounded()))
-        return value < 0 ? -units : units
+        // The iPad14,6 log showed ~100 raw units in 24 callbacks from one light
+        // gesture. At the default 0.3 setting that becomes about six wheel steps.
+        remainder += min(max(value, -16), 16) * scale * 0.2
+        let whole = Int32(remainder.rounded(.towardZero))
+        remainder -= Float(whole)
+        return whole
     }
 }
