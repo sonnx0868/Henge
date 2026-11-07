@@ -27,6 +27,8 @@ int henge_vm_state(void);
 /* Why it stopped (an HV_EXIT_* name), once state is 2. */
 const char *henge_vm_exit_reason(void);
 void henge_vm_stop(void);
+/* Enable 15-second CPU/JIT and network queue diagnostics for the next boot. */
+void henge_vm_set_diagnostics(int enabled);
 
 /* Progress, for the session screen. */
 uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */

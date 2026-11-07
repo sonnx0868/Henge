@@ -21,6 +21,9 @@ HENGE_EXPORT HengeDualMapping *henge_ios_jit_get_mapping(void);
 
 static volatile int state;
 static volatile int exit_reason;
+static int diagnostics;
+
+void henge_vm_set_diagnostics(int enabled) { diagnostics = enabled != 0; }
 
 static void on_exit(int reason) {
     exit_reason = reason;
@@ -43,7 +46,10 @@ int henge_vm_boot(const char *rom, const char *disk, const char *aux, uint64_t e
                     .jit_rx = jit->rx_addr, .jit_rw = jit->rw_addr, .jit_bytes = jit->size};
     fprintf(stderr, "henge: booting with %d CPUs, %llu MB RAM, a %zu MB JIT region\n", cpus, (unsigned long long)ram_mb,
             jit->size >> 20);
+    hv_net_set_diagnostics(diagnostics);
     if (hv_vm_create(&c, err, errlen) != 0) return -1;
+    hv_vm_machine()->stats_interval = diagnostics ? 15 : 0;
+    fprintf(stderr, "henge: performance diagnostics %s\n", diagnostics ? "on (15s intervals)" : "off");
     state = 1;
     hv_vm_start(1, on_exit);
     return 0;

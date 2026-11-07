@@ -29,12 +29,16 @@
 typedef struct Frame {
     uint32_t len;
     uint8_t *data;
+    int64_t queued_ms;
+    int waited_for_buffer;
 } Frame;
 
 typedef struct Queue {
     Frame f[QUEUE];
     uint32_t head, tail;
     pthread_mutex_t mu;
+    uint64_t dropped, processed, wait_ms, max_wait_ms, no_rx_buffer;
+    uint32_t max_depth;
 } Queue;
 
 typedef struct Timer {
@@ -52,7 +56,11 @@ static int wake_pipe[2];
 static Timer timers[MAX_TIMERS];
 static struct pollfd pfds[MAX_POLL];
 static int npfd;
+static int diagnostics;
 uint64_t hv_net_tx_frames, hv_net_rx_frames;
+
+void hv_net_set_diagnostics(int enabled) { diagnostics = enabled != 0; }
+static int64_t now_ms(void);
 
 static char share_socket[256];
 
@@ -66,12 +74,45 @@ static int push(Queue *q, const uint8_t *data, uint32_t len) {
     if (ok) {
         Frame *f = &q->f[q->tail % QUEUE];
         f->data = malloc(len);
-        memcpy(f->data, data, len);
-        f->len = len;
-        q->tail++;
+        if (f->data) {
+            memcpy(f->data, data, len);
+            f->len = len;
+            f->queued_ms = diagnostics ? now_ms() : 0;
+            f->waited_for_buffer = 0;
+            q->tail++;
+            uint32_t depth = q->tail - q->head;
+            if (depth > q->max_depth) q->max_depth = depth;
+        } else ok = 0;
     }
+    if (!ok) q->dropped++;
     pthread_mutex_unlock(&q->mu);
     return ok;
+}
+
+static void processed(Queue *q, const Frame *f) {
+    q->processed++;
+    if (diagnostics && f->queued_ms) {
+        uint64_t wait = (uint64_t)(now_ms() - f->queued_ms);
+        q->wait_ms += wait;
+        if (wait > q->max_wait_ms) q->max_wait_ms = wait;
+    }
+}
+
+static void log_queue(const char *name, Queue *q, uint64_t *last_processed, uint64_t *last_dropped,
+                      uint64_t *last_wait_ms, uint64_t *last_no_buffer) {
+    pthread_mutex_lock(&q->mu);
+    uint64_t done = q->processed - *last_processed, lost = q->dropped - *last_dropped;
+    uint64_t wait = q->wait_ms - *last_wait_ms, no_buffer = q->no_rx_buffer - *last_no_buffer;
+    uint32_t depth = q->tail - q->head, max_depth = q->max_depth;
+    uint64_t max_wait = q->max_wait_ms;
+    *last_processed = q->processed, *last_dropped = q->dropped;
+    *last_wait_ms = q->wait_ms, *last_no_buffer = q->no_rx_buffer;
+    q->max_depth = depth;
+    q->max_wait_ms = 0;
+    pthread_mutex_unlock(&q->mu);
+    fprintf(stderr, "net stats %s/15s: processed %llu dropped %llu depth %u peak %u queue wait avg %.1f ms max %llu ms no-rx-buffer %llu\n",
+            name, (unsigned long long)done, (unsigned long long)lost, depth, max_depth,
+            done ? (double)wait / done : 0.0, (unsigned long long)max_wait, (unsigned long long)no_buffer);
 }
 
 /* HV_NET_LOG: one line per frame (ethertype, IP protocol, ports). */
@@ -195,6 +236,9 @@ static const SlirpCb callbacks = {
 
 static void *net_thread(void *unused) {
     (void)unused;
+    int64_t last_stats_ms = now_ms();
+    uint64_t host_done = 0, host_dropped = 0, host_wait = 0, host_no_buffer = 0;
+    uint64_t guest_done = 0, guest_dropped = 0, guest_wait = 0, guest_no_buffer = 0;
     for (;;) {
         uint32_t timeout = 1000;
         int64_t now = now_ms();
@@ -222,12 +266,21 @@ static void *net_thread(void *unused) {
         /* What the guest sent since. */
         for (;;) {
             pthread_mutex_lock(&to_host.mu);
-            Frame f = {0, NULL};
-            if (to_host.head != to_host.tail) f = to_host.f[to_host.head++ % QUEUE];
+            Frame f = {0};
+            if (to_host.head != to_host.tail) {
+                f = to_host.f[to_host.head++ % QUEUE];
+                processed(&to_host, &f);
+            }
             pthread_mutex_unlock(&to_host.mu);
             if (!f.data) break;
             slirp_input(slirp, f.data, (int)f.len);
             free(f.data);
+        }
+        now = now_ms();
+        if (diagnostics && now - last_stats_ms >= 15000) {
+            log_queue("guest-to-host", &to_host, &host_done, &host_dropped, &host_wait, &host_no_buffer);
+            log_queue("host-to-guest", &to_guest, &guest_done, &guest_dropped, &guest_wait, &guest_no_buffer);
+            last_stats_ms = now;
         }
     }
     return NULL;
@@ -248,13 +301,23 @@ void hv_net_poll(void) {
     if (!net) return;
     for (;;) {
         pthread_mutex_lock(&to_guest.mu);
-        Frame f = {0, NULL};
+        Frame f = {0};
         if (to_guest.head != to_guest.tail) f = to_guest.f[to_guest.head % QUEUE];
         pthread_mutex_unlock(&to_guest.mu);
         if (!f.data) return;
-        if (!hv_virtio_net_receive(net, f.data, f.len)) return; /* no buffer posted yet: try again later */
+        if (!hv_virtio_net_receive(net, f.data, f.len)) {
+            pthread_mutex_lock(&to_guest.mu);
+            Frame *queued = &to_guest.f[to_guest.head % QUEUE];
+            if (!queued->waited_for_buffer) {
+                queued->waited_for_buffer = 1;
+                to_guest.no_rx_buffer++;
+            }
+            pthread_mutex_unlock(&to_guest.mu);
+            return; /* no buffer posted yet: try again later */
+        }
         hv_net_rx_frames++;
         pthread_mutex_lock(&to_guest.mu);
+        processed(&to_guest, &f);
         to_guest.head++;
         pthread_mutex_unlock(&to_guest.mu);
         free(f.data);

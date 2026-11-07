@@ -10,6 +10,8 @@ void hv_net_set_share_socket(const char *path);
 int hv_net_attach(HvMachine *m, HvVirtioNet *n);
 /* CPU thread, from the board's tick: hand frames for the guest to the device. */
 void hv_net_poll(void);
+/* Must be set before hv_net_attach; samples queue health every 15 seconds. */
+void hv_net_set_diagnostics(int enabled);
 
 extern uint64_t hv_net_tx_frames, hv_net_rx_frames;
 

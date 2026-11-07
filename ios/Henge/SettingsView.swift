@@ -6,6 +6,7 @@ struct SettingsView: View {
     @AppStorage(HardwareMouse.speedKey) private var mouseSpeed = 1.0
     @AppStorage(HardwareMouse.reverseKey) private var reverseScrolling = false
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
+    @AppStorage("henge.performanceDiagnostics") private var performanceDiagnostics = false
 
     var body: some View {
         NavigationStack {
@@ -49,6 +50,9 @@ struct SettingsView: View {
                     .listRowBackground(Desk.card)
                 }
                 Section("Log") {
+                    Toggle("Performance diagnostics", isOn: $performanceDiagnostics)
+                    Text("Logs CPU, JIT and network queue statistics every 15 seconds while a Mac runs. Turn on before starting the Mac; turn off after the test.")
+                        .font(.footnote).foregroundStyle(.secondary)
                     ShareLink(item: HengeLog.logFileURL) { Label("Share henge.log", systemImage: "square.and.arrow.up") }
                 }
                 .listRowBackground(Desk.card)

@@ -445,6 +445,7 @@ struct SessionView: View {
         var buffer = [CChar](repeating: 0, count: 256)
         Sharing.prepare()
         henge_vm_set_display(UInt32(mac.screen.width), UInt32(mac.screen.height))
+        henge_vm_set_diagnostics(UserDefaults.standard.bool(forKey: "henge.performanceDiagnostics") ? 1 : 0)
         let rc = henge_vm_boot(mac.rom.path, mac.disk.path, mac.aux.path, mac.ecid, mac.seed, ram, Int32(cpus), &buffer, buffer.count)
         if rc != 0 {
             error = String(cString: buffer)
