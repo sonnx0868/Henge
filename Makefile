@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_code_links $(B)/test_scroll_bridge $(B)/test_jit_script $(B)/test_scroll_pixels
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_code_links $(B)/test_scroll_bridge $(B)/test_jit_script $(B)/test_scroll_pixels $(B)/test_pvg_video_layout
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -91,6 +91,8 @@ $(B)/test_jit_script: tests/test_jit_script.m | $(B)
 	$(CC) -fobjc-arc -O2 -Wall -Wextra $< -framework Foundation -framework JavaScriptCore -o $@
 $(B)/test_scroll_pixels: tests/test_scroll_pixels.c tools/scroll_pixels.h | $(B)
 	$(CC) $(CFLAGS) tests/test_scroll_pixels.c -o $@
+$(B)/test_pvg_video_layout: tests/test_pvg_video_layout.c devices/pvg_video_layout.h | $(B)
+	$(CC) $(CFLAGS) tests/test_pvg_video_layout.c -o $@
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@

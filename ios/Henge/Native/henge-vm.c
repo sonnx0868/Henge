@@ -116,6 +116,16 @@ void henge_vm_stop(void) { if (state == 1) hv_vm_stop(); }
 
 uint64_t henge_vm_blocks(void) { return state ? hv_vm_machine()->stats.blocks : 0; }
 uint64_t henge_vm_net_frames(int sent) { return sent ? hv_net_tx_frames : hv_net_rx_frames; }
+uint64_t henge_vm_audio_underruns(void) {
+    HvVirtioSnd *snd = state ? hv_vm_board()->snd : NULL;
+    return snd ? atomic_load(&snd->underruns) : 0;
+}
+uint64_t henge_vm_audio_queued_bytes(void) {
+    HvVirtioSnd *snd = state ? hv_vm_board()->snd : NULL;
+    if (!snd) return 0;
+    uint64_t written = atomic_load(&snd->written), consumed = atomic_load(&snd->consumed);
+    return written > consumed ? written - consumed : 0;
+}
 
 int henge_vm_cpus_on(void) {
     int n = 0;

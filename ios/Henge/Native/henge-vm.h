@@ -33,6 +33,8 @@ void henge_vm_set_diagnostics(int enabled);
 /* Progress, for the session screen. */
 uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
 uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
+uint64_t henge_vm_audio_underruns(void);
+uint64_t henge_vm_audio_queued_bytes(void);
 int henge_vm_cpus_on(void);                /* CPUs the guest has started */
 int henge_vm_guest_el0(void);              /* any CPU running user code right now */
 

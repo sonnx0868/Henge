@@ -14,6 +14,7 @@
 #import <objc/message.h>
 #import <TargetConditionals.h>
 #import <IOSurface/IOSurfaceRef.h>
+#include "pvg_video_layout.h"
 #include <string.h>
 #include <sys/utsname.h>
 
@@ -89,9 +90,10 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     /* Multi-plane surfaces cannot sit on a buffer: a real IOSurface, kept up to date from the guest's pages. */
     IOSurfaceRef iosurface;
     uint64_t alloc, content_hash;
+    BOOL content_valid;
     /* Source layout for a multi-plane video surface. */
     uint32_t plane_count;
-    uint64_t plane_from[4], plane_row[4], plane_h[4];
+    uint64_t plane_from[4], plane_row[4], plane_h[4], plane_bytes[4];
     /* A heap: private memory, a buffer over all of it. */
     id<MTLBuffer> heap_whole;
     /* A heap's or a private texture's copy in guest memory, and which side has the newest bytes. */
@@ -124,6 +126,8 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     NSMutableDictionary<NSNumber *, HvObject *> *surfaces;
     NSMutableSet<NSString *> *complaints;
     uint64_t execs, draws, failed, heap_bytes, synced, remaps;
+    uint64_t video_uploads, video_skips, video_fences, video_copy_failures;
+    double video_wait_time;
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
        GPU's completion handlers run in the order of commit. */
     _Atomic int inflight;
@@ -181,6 +185,10 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
 
 static double now_seconds(void) {
     return (double)clock_gettime_nsec_np(CLOCK_MONOTONIC) * 1e-9;
+}
+
+static int read_mapped_descriptor(void *context, uint32_t task, uint64_t address, void *out, uint32_t bytes) {
+    return hv_pvg_lite_task_read((HvPvgLite *)context, task, address, out, bytes);
 }
 
 /* A contiguous view of a task's guest pages; holes are left as zero pages. */
@@ -492,6 +500,8 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     memcpy(o->tex_layout, layout + 0x18, table);
     const uint8_t *rec = layout + 0x18 + table;
     uint32_t tag = *(const uint32_t *)rec;
+    uint32_t description_bytes = tag == 0x34 || tag == 0x39 ? HV_PVG_DESC_V2_BYTES : HV_PVG_DESC_V1_BYTES;
+    if (12ull + 0x18 + table + 12 + description_bytes > size) { [self complain:@"texture descriptor truncated"]; return; }
     MTLTextureDescriptor *t = (tag == 0x34 || tag == 0x39) ? descriptor_v2(rec + 12) : descriptor_v1(rec + 12);
     t.storageMode = MTLStorageModePrivate;
     t.usage |= MTLTextureUsageShaderRead;
@@ -574,6 +584,7 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
     uint32_t fourcc, planes = desc[0x3e];
     uint64_t width, height;
     memcpy(&fourcc, desc + 4, 4), memcpy(&width, desc + 0x20, 8), memcpy(&height, desc + 0x28, 8);
+    if (planes < 2 || planes > 4) return NULL;
     NSMutableArray *info = [NSMutableArray new], *plain = [NSMutableArray new];
     uint64_t at = 0;
     for (uint32_t i = 0; i < planes && i < 4; i++) {
@@ -581,6 +592,7 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
         uint64_t off, size, w, h, row;
         uint16_t bpe;
         memcpy(&off, pl + 8, 8), memcpy(&size, pl + 0x18, 8), memcpy(&w, pl + 0x20, 8), memcpy(&h, pl + 0x28, 8), memcpy(&row, pl + 0x30, 8), memcpy(&bpe, pl + 0x38, 2);
+        if (!bpe || w > UINT64_MAX / bpe) return NULL;
         [info addObject:@{(__bridge id)kIOSurfacePlaneWidth: @(w), (__bridge id)kIOSurfacePlaneHeight: @(h), (__bridge id)kIOSurfacePlaneBytesPerRow: @(row),
                           (__bridge id)kIOSurfacePlaneOffset: @(off), (__bridge id)kIOSurfacePlaneSize: @(size), (__bridge id)kIOSurfacePlaneBytesPerElement: @(bpe),
                           (__bridge id)kIOSurfacePlaneElementWidth: @1, (__bridge id)kIOSurfacePlaneElementHeight: @1}];
@@ -588,6 +600,7 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
                            (__bridge id)kIOSurfacePlaneOffset: @(at), (__bridge id)kIOSurfacePlaneSize: @(row * h), (__bridge id)kIOSurfacePlaneBytesPerElement: @(bpe),
                            (__bridge id)kIOSurfacePlaneElementWidth: @1, (__bridge id)kIOSurfacePlaneElementHeight: @1}];
         to->plane_from[i] = off, to->plane_row[i] = row, to->plane_h[i] = h;
+        to->plane_bytes[i] = w * bpe;
         at += row * h;
     }
     NSDictionary *props = @{(__bridge id)kIOSurfaceWidth: @(width), (__bridge id)kIOSurfaceHeight: @(height), (__bridge id)kIOSurfacePixelFormat: @(fourcc),
@@ -600,19 +613,27 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
     }
     if (made) {
         to->plane_count = planes;
-        static int logged;
-        if (planes >= 2 && logged++ < 4)
+        static NSMutableSet<NSString *> *logged;
+        if (!logged) logged = [NSMutableSet new];
+        NSMutableString *key = [NSMutableString stringWithFormat:@"%08x:%llu:%llu", fourcc,
+                                (unsigned long long)width, (unsigned long long)height];
+        for (uint32_t i = 0; i < planes; i++)
+            [key appendFormat:@":%llu:%llu:%llu:%llu", (unsigned long long)to->plane_from[i],
+             (unsigned long long)to->plane_row[i], (unsigned long long)to->plane_h[i], (unsigned long long)to->plane_bytes[i]];
+        if (logged.count < 32 && ![logged containsObject:key]) {
+            [logged addObject:key];
             for (uint32_t i = 0; i < planes && i < IOSurfaceGetPlaneCount(made) && i < 4; i++)
-                fprintf(stderr, "hengevm: video plane %u guest off %llu row %llu h %llu; host row %zu h %zu\n",
-                        i, (unsigned long long)to->plane_from[i], (unsigned long long)to->plane_row[i],
-                        (unsigned long long)to->plane_h[i], IOSurfaceGetBytesPerRowOfPlane(made, i),
+                fprintf(stderr, "hengevm: video plane %u fourcc %08x guest off %llu row %llu h %llu visible %llu; host row %zu h %zu\n",
+                        i, fourcc, (unsigned long long)to->plane_from[i], (unsigned long long)to->plane_row[i],
+                        (unsigned long long)to->plane_h[i], (unsigned long long)to->plane_bytes[i], IOSurfaceGetBytesPerRowOfPlane(made, i),
                         IOSurfaceGetHeightOfPlane(made, i));
+        }
     }
     return made;
 }
 
 /* Guest pixels into its IOSurface, when they changed. A sample of every 64th byte says so cheaply. */
-static void sync_iosurface(HvObject *s) {
+static void sync_iosurface(HvReplay *r, HvObject *s) {
     if (!s->iosurface) return;
     const uint8_t *from = s->mapped + s->first;
     uint64_t hash = 0xcbf29ce484222325ull;
@@ -621,27 +642,51 @@ static void sync_iosurface(HvObject *s) {
         memcpy(&v, from + i, 8);
         hash = (hash ^ v) * 0x100000001b3ull;
     }
-    if (hash == s->content_hash) return;
-    s->content_hash = hash;
-    IOSurfaceLock(s->iosurface, 0, NULL);
+    if (s->content_valid && hash == s->content_hash) { r->video_skips++; return; }
+    /* CPU writes to Shared IOSurface storage must not overlap an older GPU
+       command buffer sampling it. The serial Metal queue's last buffer covers
+       all earlier readers; only changed video uploads need this fence. */
+    if (s->content_valid && r->last_cb && r->last_cb.status < MTLCommandBufferStatusCompleted) {
+        double began = now_seconds();
+        [r->last_cb waitUntilCompleted];
+        r->video_wait_time += now_seconds() - began;
+        r->video_fences++;
+    }
+    if (IOSurfaceLock(s->iosurface, 0, NULL) != KERN_SUCCESS) {
+        r->video_copy_failures++;
+        [r complain:@"video IOSurface lock failed"];
+        return;
+    }
+    BOOL valid = YES;
     if (s->plane_count && IOSurfaceGetPlaneCount(s->iosurface) >= s->plane_count) {
         /* IOSurface can choose different offsets and row strides from those
            requested. Copy each video plane through its actual host layout. */
-        for (uint32_t i = 0; i < s->plane_count && i < 4; i++) {
+        /* Check every plane before writing any: a partial Y/UV update displays
+           a new luma frame with old chroma, often appearing green/magenta. */
+        for (uint32_t i = 0; i < s->plane_count; i++) {
+            HvPvgVideoPlane p = {s->plane_from[i], s->plane_row[i], s->plane_h[i], s->plane_bytes[i]};
+            if (!IOSurfaceGetBaseAddressOfPlane(s->iosurface, i) ||
+                !hv_pvg_video_plane_valid(p, s->alloc, IOSurfaceGetBytesPerRowOfPlane(s->iosurface, i),
+                                           IOSurfaceGetHeightOfPlane(s->iosurface, i))) valid = NO;
+        }
+        for (uint32_t i = 0; valid && i < s->plane_count; i++) {
             uint8_t *dst = IOSurfaceGetBaseAddressOfPlane(s->iosurface, i);
             size_t dst_row = IOSurfaceGetBytesPerRowOfPlane(s->iosurface, i);
-            size_t rows = MIN((size_t)s->plane_h[i], IOSurfaceGetHeightOfPlane(s->iosurface, i));
-            uint64_t src_row = s->plane_row[i], src_off = s->plane_from[i];
-            if (!dst || !src_row || src_off > s->alloc || rows > (s->alloc - src_off) / src_row) continue;
-            size_t bytes = MIN((size_t)src_row, dst_row);
-            for (size_t y = 0; y < rows; y++)
-                memcpy(dst + y * dst_row, from + src_off + y * src_row, bytes);
+            HvPvgVideoPlane p = {s->plane_from[i], s->plane_row[i], s->plane_h[i], s->plane_bytes[i]};
+            hv_pvg_video_plane_copy(dst, dst_row, from, p);
         }
     } else {
-        uint8_t *base = IOSurfaceGetBaseAddress(s->iosurface);
-        memcpy(base, from, MIN(s->alloc, IOSurfaceGetAllocSize(s->iosurface)));
+        valid = NO;
     }
     IOSurfaceUnlock(s->iosurface, 0, NULL);
+    if (!valid) {
+        r->video_copy_failures++;
+        [r complain:[NSString stringWithFormat:@"video plane layout invalid: fourcc %08x %ux%u", s->fourcc, s->surface_w, s->surface_h]];
+        return;
+    }
+    s->content_hash = hash;
+    s->content_valid = YES;
+    r->video_uploads++;
     const char *dump = getenv("HV_PVG_SURFACE_DUMP");
     static int dumped;
     if (dump && s->plane_count && dumped < 6) {
@@ -658,11 +703,12 @@ static void sync_iosurface(HvObject *s) {
    (physical >> 12, bit 0 present, one per 16 KB), first-page offset +0x60,
    allocation +0x18, bytes per row +0x30. */
 - (void)makeMappedTexture:(HvObject *)o at:(uint64_t)at task:(uint32_t)task {
-    struct __attribute__((packed)) { uint64_t mapping; uint32_t tag, size, ref; uint8_t d[32]; } h;
-    if (hv_pvg_lite_task_read(lite, task, at, &h, sizeof h)) return;
+    HvPvgMappedHeader h;
+    uint8_t description[HV_PVG_DESC_V2_BYTES];
+    if (hv_pvg_read_mapped_descriptor(read_mapped_descriptor, lite, task, at, &h, description)) return;
     NSNumber *key = @(h.mapping);
     HvObject *surface = surfaces[key];
-    MTLTextureDescriptor *t = h.tag == 0x39 ? descriptor_v2(h.d) : descriptor_v1(h.d);
+    MTLTextureDescriptor *t = h.tag == 0x39 ? descriptor_v2(description) : descriptor_v1(description);
     if (!surface) {
         const uint8_t *desc = hv_pvg_lite_surface(lite, (uint32_t)h.mapping);
         if (!desc) { [self complain:[NSString stringWithFormat:@"surface %llu has no descriptor", h.mapping]]; return; }
@@ -704,7 +750,7 @@ static void sync_iosurface(HvObject *s) {
                 for (int i = 0; i < 96; i++) [m appendFormat:@" %08x", ((const uint32_t *)desc)[i]];
                 [self complain:m];
             }
-            sync_iosurface(surface);
+            sync_iosurface(self, surface);
         }
         fprintf(stderr, "hengevm: pvg-metal: surface %llu: %lux%lu format %lu, row %llu, %llu KB, fourcc %c%c%c%c planes %u\n", h.mapping, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], desc[0x3e]);
     }
@@ -1614,7 +1660,7 @@ typedef struct {
         HvObject *o = [self object:res[i * 2] task:task];
         if (!o) continue;
         if (o->mapped) refresh_pages(self, task, o);
-        if (o->surface) sync_iosurface(o->surface);
+        if (o->surface) sync_iosurface(self, o->surface);
         if (getenv("HV_PVG_TALLY") && (o->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE) {
             static uint32_t seen[256];
             uint32_t f = res[i * 2 + 1] & 0xff, key = res[i * 2] & 0xff;
@@ -1723,6 +1769,9 @@ typedef struct {
         static double t0;
         if (!t0) t0 = now_seconds();
         fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, waiting for the GPU %.2f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time);
+        fprintf(stderr, "hengevm: video uploads %llu unchanged %llu fenced %llu copy failures %llu GPU fence wait %.3f s\n",
+                (unsigned long long)video_uploads, (unsigned long long)video_skips, (unsigned long long)video_fences,
+                (unsigned long long)video_copy_failures, video_wait_time);
         encode_time = gpu_wait_time = 0;
     }
     return YES;

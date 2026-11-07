@@ -47,7 +47,8 @@ typedef struct HvVirtioSnd {
     HvVirtqElem pending[HV_VSND_PENDING];
     uint64_t pending_end[HV_VSND_PENDING]; /* `written` after this buffer's data */
     uint32_t phead, pcopy, ptail; /* pcopy: next one whose audio is not yet in the ring */
-    uint64_t underruns, xfers;
+    _Atomic uint64_t underruns;
+    uint64_t xfers;
 } HvVirtioSnd;
 
 HvVirtioSnd *hv_virtio_snd_create(HvMachine *m, HvPcie *bus);

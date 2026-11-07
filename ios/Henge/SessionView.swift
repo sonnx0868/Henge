@@ -464,6 +464,7 @@ struct SessionView: View {
         var lastBlocks = henge_vm_blocks()
         var lastTime = Date()
         var lastGPUFrames = henge_vm_gpu_frames()
+        var lastAudioUnderruns = henge_vm_audio_underruns()
         var tick = 0
         while !Task.isCancelled {
             state = henge_vm_state()
@@ -487,9 +488,12 @@ struct SessionView: View {
             tick += 1
             if tick % 10 == 0 {
                 let gpuFrames = henge_vm_gpu_frames()
+                let audioUnderruns = henge_vm_audio_underruns()
                 HengeLog.log("perf", "blocks/s \(String(format: "%.0f", blocksPerSecond)), GPU frames/10s \(gpuFrames &- lastGPUFrames), "
-                             + "network tx \(framesOut), rx \(framesIn), thermal \(Self.thermalLabel(heat))")
+                             + "network tx \(framesOut), rx \(framesIn), thermal \(Self.thermalLabel(heat)), "
+                             + "audio underruns/10s \(audioUnderruns &- lastAudioUnderruns), queued \(henge_vm_audio_queued_bytes()) bytes")
                 lastGPUFrames = gpuFrames
+                lastAudioUnderruns = audioUnderruns
             }
             if tick % 30 == 0 { HengeLog.logFootprint("session") } // how close to the limit, for a memory kill leaves no crash report
             if tick % 60 == 0 { MacPreview.save(for: mac) }
