@@ -129,21 +129,49 @@ function JIT26PrepareRegion(brkResponse) {
     }
 
     let jitPageAddress = x0;
+    let allocatedHere = false;
+    function failed(reason) {
+        log(`JIT region preparation failed: ${reason}`);
+        if (allocatedHere) {
+            log(`release failed JIT allocation: ${send_command(`_m${jitPageAddress.toString(16)}`)}`);
+        }
+        send_command(`P0=${numberToLittleEndianHexString(0n)};thread:${tid};`);
+    }
     if (x0 == 0n) {
         let requestRXResponse = send_command(`_M${x1.toString(16)},rx`);
         log(`requestRXResponse = ${requestRXResponse}`);
         
-        if (!requestRXResponse || requestRXResponse.length === 0) {
-            log(`Failed to allocate RX memory`);
+        if (!requestRXResponse || !/^[0-9a-f]+$/i.test(requestRXResponse) || /^E[0-9a-f]{2}$/i.test(requestRXResponse)) {
+            failed(`RX allocation returned ${requestRXResponse}`);
             return;
         }
         
         jitPageAddress = BigInt(`0x${requestRXResponse}`);
+        allocatedHere = true;
         log(`Allocated JIT page at address: 0x${jitPageAddress.toString(16)}`);
     }
 
-    let prepareJITPageResponse = prepare_memory_region(jitPageAddress, x1);
+    // StikJIT exposes this native callback as (Double, Double), not BigInt.
+    // JavaScriptCore can convert BigInt arguments to zero at that boundary:
+    // a zero length used to return "OK" without preparing any executable pages.
+    const address = Number(jitPageAddress), length = Number(x1);
+    if (!Number.isSafeInteger(address) || address <= 0 || jitPageAddress % 16384n !== 0n ||
+        !Number.isSafeInteger(length) || length <= 0) {
+        failed(`invalid address/length ${jitPageAddress}, ${x1}`);
+        return;
+    }
+    let prepareJITPageResponse;
+    try {
+        prepareJITPageResponse = prepare_memory_region(address, length);
+    } catch (error) {
+        failed(String(error));
+        return;
+    }
     log(`prepareJITPageResponse = ${prepareJITPageResponse}`);
+    if (prepareJITPageResponse !== "OK") {
+        failed(`prepare_memory_region returned ${prepareJITPageResponse}`);
+        return;
+    }
 
     let putX0Response = send_command(`P0=${numberToLittleEndianHexString(jitPageAddress)};thread:${tid};`);
     log(`putX0Response = ${putX0Response}`);

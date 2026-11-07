@@ -1,5 +1,5 @@
 diff --git a/Sources/ScriptRunner.swift b/Sources/ScriptRunner.swift
-index e01b8e5..0021eb4 100644
+index e01b8e5..35efa4d 100644
 --- a/Sources/ScriptRunner.swift
 +++ b/Sources/ScriptRunner.swift
 @@ -5,7 +5,8 @@ import JavaScriptCore
@@ -12,7 +12,62 @@ index e01b8e5..0021eb4 100644
      private static let commandsPerBatch = 128
  
      private let targetPID: Int32
-@@ -124,21 +125,22 @@ final class ScriptRunner {
+@@ -40,6 +41,12 @@ final class ScriptRunner {
+         }
+         let prepare: @convention(block) (Double, Double) -> String = { [weak self] address, length in
+             guard let self else { return "" }
++            guard address.isFinite, length.isFinite, address > 0, length > 0,
++                  address <= 9007199254740991, length <= 9007199254740991,
++                  address.rounded(.towardZero) == address, length.rounded(.towardZero) == length else {
++                self.recordExecutionError(.scriptExecution("Invalid JIT address/length at the JavaScript bridge: \(address), \(length)"))
++                return ""
++            }
+             return self.prepareMemoryRegion(UInt64(address), length: UInt64(length)) ?? ""
+         }
+         let log: @convention(block) (JSValue?) -> Void = { [weak self] value in
+@@ -71,7 +78,10 @@ final class ScriptRunner {
+     }
+ 
+     private func prepareMemoryRegion(_ address: UInt64, length: UInt64) -> String? {
+-        guard length > 0 else { return "OK" }
++        guard length > 0 else {
++            recordExecutionError(.scriptExecution("Refusing to report success for an empty JIT region"))
++            return nil
++        }
+         let pageCount = Int((length - 1) / Self.jitPageSize + 1)
+ 
+         let commandBuffer = Self.makeBlessCommands(startAddress: address, pageCount: pageCount)
+@@ -90,16 +100,28 @@ final class ScriptRunner {
+                 return nil
+             }
+ 
+-            for _ in 0..<commandsInBatch {
++            var failure: String?
++            for page in 0..<commandsInBatch {
+                 var response: UnsafeMutablePointer<CChar>?
+                 let readError = debug_proxy_read_response(debugProxy, &response)
++                var responseText = ""
+                 if let response {
++                    responseText = String(cString: response)
+                     idevice_string_free(response)
+                 }
+                 if let readError {
+                     recordExecutionError(IdeviceFFI.consume(readError, fallback: "debug_proxy_read_response"))
+                     return nil
+                 }
++                if responseText != "OK", failure == nil {
++                    let failedAddress = address + UInt64(batchStart + page) * Self.jitPageSize
++                    failure = "JIT preparation failed at 0x\(String(failedAddress, radix: 16)): \(responseText)"
++                }
++            }
++            // Drain the whole batch before another command (including cleanup) can be sent.
++            if let failure {
++                recordExecutionError(.scriptExecution(failure))
++                return nil
+             }
+         }
+ 
+@@ -124,21 +146,22 @@ final class ScriptRunner {
              buffer[start + 0] = UInt8(ascii: "$")
              buffer[start + 1] = UInt8(ascii: "M")
              writeHexAddress(pageAddress, into: &buffer, at: start + 2)

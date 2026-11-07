@@ -12,7 +12,7 @@ ENGINE = $(CORE) $(HOST)
 METAL_LIBS = -framework Foundation -framework QuartzCore -framework Metal -framework IOSurface -framework CoreGraphics -framework ImageIO -framework UniformTypeIdentifiers
 
 TESTS = $(B)/test_classify $(B)/test_jit_region $(B)/test_operands $(B)/test_jit $(B)/test_mem \
-        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_code_links $(B)/test_scroll_bridge
+        $(B)/test_mmu $(B)/test_exc $(B)/test_devices $(B)/test_code_links $(B)/test_scroll_bridge $(B)/test_jit_script
 
 all: $(TESTS) $(B)/hengevm $(B)/hengevm-ref $(B)/hvsparse
 
@@ -87,6 +87,8 @@ $(B)/test_code_links: tests/test_code_links.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_code_links.c $(ENGINE) -o $@
 $(B)/test_scroll_bridge: tests/test_scroll_bridge.c $(B)/share.o
 	$(CC) $(CFLAGS) tests/test_scroll_bridge.c $(B)/share.o -o $@
+$(B)/test_jit_script: tests/test_jit_script.m | $(B)
+	$(CC) -fobjc-arc -O2 -Wall -Wextra $< -framework Foundation -framework JavaScriptCore -o $@
 
 $(B)/hvsparse: tools/hvsparse_main.c host/hvsparse.c host/hvsparse.h | $(B)
 	$(CC) $(CFLAGS) tools/hvsparse_main.c host/hvsparse.c -o $@

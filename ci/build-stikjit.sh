@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Rebuild StikJIT 1.9.0 with full-width debugserver addresses. Its shipped
-# nine-digit packet format truncates JIT mappings above 0xfffffffff on iPads.
+# Rebuild StikJIT 1.9.0 with full-width debugserver addresses and checked JIT
+# preparation arguments/replies. Never treat an empty or failed region as executable.
 set -euo pipefail
 
 HENGE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
