@@ -463,30 +463,16 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes);
 static HengeDualMapping henge_prewarmed;
 static bool henge_prewarm_done;
 
-HENGE_EXPORT bool henge_ios_jit_prewarm_with_fallback(size_t preferred, size_t fallback)
+HENGE_EXPORT bool henge_ios_jit_prewarm(size_t bytes)
 {
     if (henge_prewarm_done) {
         return henge_prewarmed.rw_addr != NULL;
     }
     henge_prewarm_done = true;
-    henge_prewarmed = henge_ios_jit_allocate_real(preferred);
-    if (!henge_prewarmed.rw_addr && fallback && fallback < preferred) {
-        HENGE_LOG("preferred JIT region failed; retrying %zu MiB before the debugger detaches", fallback >> 20);
-        henge_prewarmed = henge_ios_jit_allocate_real(fallback);
-    }
+    henge_prewarmed = henge_ios_jit_allocate_real(bytes);
     fprintf(stderr, "[henge-jit] prewarm %s: %zu bytes\n",
-            henge_prewarmed.rw_addr ? "OK" : "FAILED", henge_prewarmed.rw_addr ? henge_prewarmed.size : preferred);
+            henge_prewarmed.rw_addr ? "OK" : "FAILED", bytes);
     return henge_prewarmed.rw_addr != NULL;
-}
-
-HENGE_EXPORT bool henge_ios_jit_prewarm(size_t bytes)
-{
-    return henge_ios_jit_prewarm_with_fallback(bytes, 0);
-}
-
-HENGE_EXPORT size_t henge_ios_jit_region_size(void)
-{
-    return henge_prewarmed.rw_addr ? henge_prewarmed.size : 0;
 }
 
 /*
@@ -673,7 +659,6 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
     if (kr != KERN_SUCCESS) {
         HENGE_LOG("#%llu: vm_remap failed for rx=%p size=%zu: %d (%s)",
                  (unsigned long long)n, rx, bytes, (int)kr, mach_error_string(kr));
-        vm_deallocate(mach_task_self(), (vm_address_t)rx, (vm_size_t)bytes);
         return region;
     }
 
@@ -684,7 +669,6 @@ static HengeDualMapping henge_ios_jit_allocate_real(size_t bytes)
                  (unsigned long long)n, (void *)rw, bytes, (int)kr,
                  mach_error_string(kr));
         vm_deallocate(mach_task_self(), rw, (vm_size_t)bytes);
-        vm_deallocate(mach_task_self(), (vm_address_t)rx, (vm_size_t)bytes);
         return region;
     }
 

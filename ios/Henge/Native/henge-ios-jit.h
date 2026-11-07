@@ -84,10 +84,7 @@ HengeDualMapping henge_ios_jit_allocate(size_t bytes);
  * will ask for (tb-size).
  */
 HENGE_EXPORT bool henge_ios_jit_prewarm(size_t bytes);
-/* Try a larger region for capable devices, then the known working size while the debugger is still attached. */
-HENGE_EXPORT bool henge_ios_jit_prewarm_with_fallback(size_t preferred, size_t fallback);
 HENGE_EXPORT bool henge_ios_jit_prewarm_self(size_t bytes);
-HENGE_EXPORT size_t henge_ios_jit_region_size(void);
 
 /*
  * The native runtime shares the prewarmed region with QEMU: it takes bytes from the bottom, QEMU the top. Call before
