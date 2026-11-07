@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <math.h>
 #include <pthread.h>
 #include <removefile.h>
 #include <stdint.h>
@@ -48,7 +49,8 @@ static time_t agent_seen;
 
 static pthread_mutex_t scroll_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t scroll_cond = PTHREAD_COND_INITIALIZER;
-static int scroll_x, scroll_y, scroll_active;
+static double scroll_x, scroll_y, scroll_scale = 0.3;
+static int scroll_active;
 static unsigned long scroll_client;
 static int64_t scroll_seen_ms, scroll_motion_ms;
 
@@ -65,16 +67,17 @@ int hv_share_scroll_ready(void) {
     return ready;
 }
 
-int hv_share_scroll_pixels(int dx, int dy) {
+int hv_share_scroll_motion(double dx, double dy, double scale) {
+    if (!isfinite(dx) || !isfinite(dy) || !isfinite(scale) || scale < 0.1 || scale > 1.5) return 0;
     pthread_mutex_lock(&scroll_mu);
     int64_t now = monotonic_ms();
     int ready = scroll_active && now - scroll_seen_ms < 2000;
     if (ready) {
         if (now - scroll_motion_ms > 100) scroll_x = scroll_y = 0;
         /* Never turn a stalled guest into a backlog of scrolling after the finger stops. */
-        int64_t x = (int64_t)scroll_x + dx, y = (int64_t)scroll_y + dy;
-        scroll_x = x < -128 ? -128 : x > 128 ? 128 : (int)x;
-        scroll_y = y < -128 ? -128 : y > 128 ? 128 : (int)y;
+        scroll_x = fmin(fmax(scroll_x + dx, -64), 64);
+        scroll_y = fmin(fmax(scroll_y + dy, -64), 64);
+        scroll_scale = scale;
         scroll_motion_ms = now;
         pthread_cond_signal(&scroll_cond);
     }
@@ -702,6 +705,7 @@ static int scroll_stream(Conn *c, Request *r) {
     scroll_x = scroll_y = 0;
     scroll_seen_ms = monotonic_ms();
     scroll_active = 1;
+    fprintf(stderr, "henge: precise scroll protocol v2 connected\n");
     pthread_cond_broadcast(&scroll_cond);
     pthread_mutex_unlock(&scroll_mu);
     int rc = 0;
@@ -714,12 +718,12 @@ static int scroll_stream(Conn *c, Request *r) {
             if (pthread_cond_timedwait(&scroll_cond, &scroll_mu, &until) == ETIMEDOUT) break;
         }
         if (client != scroll_client) { pthread_mutex_unlock(&scroll_mu); break; }
-        int x = scroll_x, y = scroll_y;
+        double x = scroll_x, y = scroll_y, scale = scroll_scale;
         if (monotonic_ms() - scroll_motion_ms > 100) x = y = 0;
         scroll_x = scroll_y = 0;
         pthread_mutex_unlock(&scroll_mu);
-        char line[64];
-        int n = snprintf(line, sizeof line, "%d %d\n", x, y);
+        char line[128];
+        int n = snprintf(line, sizeof line, "%.6f %.6f %.6f\n", x, y, scale);
         if ((rc = send_all(c->fd, line, (size_t)n)) != 0) break;
         pthread_mutex_lock(&scroll_mu);
         if (client == scroll_client) scroll_seen_ms = monotonic_ms();
@@ -732,6 +736,23 @@ static int scroll_stream(Conn *c, Request *r) {
     return rc;
 }
 
+static int scroll_report(Conn *c, Request *r) {
+    size_t len = 0;
+    char *body = body_small(c, r, &len);
+    if (!body) return -1;
+    double scale, raw_x, raw_y, delay;
+    long long x, y, point_x, point_y;
+    unsigned frames, dropped;
+    int ok = sscanf(body, "%lf %lf %lf %lld %lld %lld %lld %u %lf %u", &scale, &raw_x, &raw_y,
+                    &x, &y, &point_x, &point_y, &frames, &delay, &dropped) == 10;
+    free(body);
+    if (!ok || !isfinite(scale) || !isfinite(raw_x) || !isfinite(raw_y) || !isfinite(delay))
+        return respond_empty(c, r, 400, "Bad Request");
+    fprintf(stderr, "henge: scroll applied: scale %.3f raw %.2f %.2f requested pixels %lld %lld CG points %lld %lld frames %u max queue %.1f ms stale %u\n",
+            scale, raw_x, raw_y, x, y, point_x, point_y, frames, delay, dropped);
+    return respond_empty(c, r, 204, "No Content");
+}
+
 static int serve_henge(Conn *c, Request *r) {
     const char *what = r->path + strlen("/.henge/");
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
@@ -741,7 +762,8 @@ static int serve_henge(Conn *c, Request *r) {
     if (!strcmp(what, "agent") && !strcmp(r->method, "GET")) return serve_agent(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "GET")) return clipboard_get(c, r);
     if (!strcmp(what, "clipboard") && !strcmp(r->method, "PUT")) return clipboard_put(c, r);
-    if (!strcmp(what, "scroll") && !strcmp(r->method, "GET")) return scroll_stream(c, r);
+    if (!strcmp(what, "scroll-v2") && !strcmp(r->method, "GET")) return scroll_stream(c, r);
+    if (!strcmp(what, "scroll-report") && !strcmp(r->method, "POST")) return scroll_report(c, r);
     if (body_discard(c, r) != 0) return -1;
     return respond_empty(c, r, 404, "Not Found");
 }

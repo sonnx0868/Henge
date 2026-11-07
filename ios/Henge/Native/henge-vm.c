@@ -148,8 +148,8 @@ void henge_vm_mouse_scroll(int dx, int dy) {
     if (dy) hv_vm_mouse_wheel(dy);
     if (dx) hv_vm_mouse_hwheel(dx);
 }
-int henge_vm_mouse_scroll_pixels(int dx, int dy) {
-    return state == 1 && hv_share_scroll_pixels(dx, dy);
+int henge_vm_mouse_scroll_motion(double dx, double dy, double scale) {
+    return state == 1 && hv_share_scroll_motion(dx, dy, scale);
 }
 int henge_vm_pixel_scroll_ready(void) { return state == 1 && hv_share_scroll_ready(); }
 int henge_vm_pointer(int *x, int *y) { return state == 1 ? hv_vm_pointer(x, y) : -1; }

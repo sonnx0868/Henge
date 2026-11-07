@@ -128,7 +128,6 @@ final class HardwareMouse {
     private var speed: Float = 1
     private var reverse = false
     private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
-    private var lastScrollFirst: Float = 0, lastScrollSecond: Float = 0
     private var scrollMotion = ScrollMotion()
     private var scrollFlush: DispatchWorkItem?
     private var lastScrollTime: TimeInterval = 0, lastWheelTime: TimeInterval = 0
@@ -142,8 +141,6 @@ final class HardwareMouse {
         let defaults = UserDefaults.standard
         speed = defaults.object(forKey: Self.speedKey) == nil ? 1 : Float(defaults.double(forKey: Self.speedKey))
         reverse = defaults.bool(forKey: Self.reverseKey)
-        lastScrollFirst = 0
-        lastScrollSecond = 0
         scrollFlush?.cancel()
         scrollFlush = nil
         scrollMotion = ScrollMotion()
@@ -184,6 +181,8 @@ final class HardwareMouse {
             input.rightButton?.pressedChangedHandler = nil
             input.middleButton?.pressedChangedHandler = nil
             input.scroll.valueChangedHandler = nil
+            input.scroll.xAxis.valueChangedHandler = nil
+            input.scroll.yAxis.valueChangedHandler = nil
         }
         mice.removeAll()
     }
@@ -201,8 +200,14 @@ final class HardwareMouse {
         input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(0, pressed) }
         input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(1, pressed) }
         input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in self?.button(2, pressed) }
-        input.scroll.valueChangedHandler = { [weak self] _, first, second in
-            DispatchQueue.main.async { self?.scrolled(first, second) }
+        input.scroll.valueChangedHandler = nil
+        // Each axis reports its own relative events. Comparing values to the
+        // previous callback drops legitimate identical deltas during steady motion.
+        input.scroll.xAxis.valueChangedHandler = { [weak self] _, value in
+            DispatchQueue.main.async { self?.scrolled(horizontal: 0, vertical: -value) }
+        }
+        input.scroll.yAxis.valueChangedHandler = { [weak self] _, value in
+            DispatchQueue.main.async { self?.scrolled(horizontal: value, vertical: 0) }
         }
     }
 
@@ -227,22 +232,10 @@ final class HardwareMouse {
         }
     }
 
-    /// GameController puts vertical motion on the first axis and horizontal on the second.
     /// Coalesce high-resolution pad callbacks before delivering a display frame.
-    private func scrolled(_ first: Float, _ second: Float) {
+    private func scrolled(horizontal: Float, vertical: Float) {
         guard running else { return }
-        // GameController reports both axis states when either one changes. On a
-        // Magic Keyboard it calls us twice per movement, with one stale axis in
-        // each call; sending both values doubles the scroll and adds sideways drift.
-        let verticalChanged = first != lastScrollFirst
-        let horizontalChanged = second != lastScrollSecond
-        lastScrollFirst = first
-        lastScrollSecond = second
-        let mostlyVertical = abs(first) > 2 * abs(second)
-        let mostlyHorizontal = abs(second) > 2 * abs(first)
-        let verticalRaw = verticalChanged && !mostlyHorizontal ? -first : 0
-        let horizontalRaw = horizontalChanged && !mostlyVertical ? second : 0
-        guard verticalRaw != 0 || horizontalRaw != 0 else { return }
+        guard horizontal != 0 || vertical != 0 else { return }
         let now = ProcessInfo.processInfo.systemUptime
         if now - lastScrollTime > 0.12 {
             scrollMotion = ScrollMotion()
@@ -252,10 +245,10 @@ final class HardwareMouse {
             scrollFramesLogged = 0
         }
         lastScrollTime = now
-        scrollMotion.append(x: horizontalRaw, y: verticalRaw)
+        scrollMotion.append(x: horizontal, y: vertical)
         if scrollDiagnostics && scrollsLogged < 24 {
             scrollsLogged += 1
-            HengeLog.log("input", "scroll raw: \(first), \(second); coalesced for pixel delivery")
+            HengeLog.log("input", "scroll raw axes: \(horizontal), \(vertical); coalesced for pixel delivery")
         }
         guard scrollFlush == nil else { return }
         let work = DispatchWorkItem { [weak self] in self?.flushScroll() }
@@ -270,23 +263,23 @@ final class HardwareMouse {
         let configured = defaults.object(forKey: Self.scrollSpeedKey) == nil
             ? 0.3 : defaults.double(forKey: Self.scrollSpeedKey)
         let scale = Float(configured.isFinite ? min(max(configured, 0.1), 1.5) : 0.3)
-        let way: Int32 = reverse ? -1 : 1
-        let (x, y) = scrollMotion.takePixels(scale: scale)
+        let way: Float = reverse ? -1 : 1
+        let (x, y) = scrollMotion.takeFrame()
         let horizontal = way * x, vertical = way * y
         guard horizontal != 0 || vertical != 0 else { return }
-        if henge_vm_mouse_scroll_pixels(horizontal, vertical) != 0 {
+        if henge_vm_mouse_scroll_motion(Double(horizontal), Double(vertical), Double(scale)) != 0 {
             fallbackX = 0
             fallbackY = 0
             if scrollDiagnostics && scrollFramesLogged < 24 {
                 scrollFramesLogged += 1
-                HengeLog.log("input", "scroll frame pixels: \(horizontal), \(vertical); scale \(scale)")
+                HengeLog.log("input", "scroll frame raw: \(horizontal), \(vertical); scale \(scale); protocol v2")
             }
             return
         }
         // Until the helper is ready, never feed a high-rate pad into the guest's
         // accelerated coarse wheel: at most one notch per axis every 50 ms.
-        fallbackX = min(max(fallbackX + Float(horizontal), -8), 8)
-        fallbackY = min(max(fallbackY + Float(vertical), -8), 8)
+        fallbackX = min(max(fallbackX + horizontal * (scale / 0.3), -8), 8)
+        fallbackY = min(max(fallbackY + vertical * (scale / 0.3), -8), 8)
         let now = ProcessInfo.processInfo.systemUptime
         guard now - lastWheelTime >= 0.05 else { return }
         let dx: Int32 = abs(fallbackX) >= 4 ? (fallbackX < 0 ? -1 : 1) : 0

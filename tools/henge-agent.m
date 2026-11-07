@@ -8,15 +8,25 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include "scroll_pixels.h"
 
 #define HOST "10.0.2.4"
 static int send_all(int fd, const void *p, size_t n);
+static NSData *request(NSString *method, NSString *path, NSData *body, int *status, unsigned long *seq);
 
 static NSLock *scrollLock;
-static int pendingScrollX, pendingScrollY;
+static double pendingScrollX, pendingScrollY, pendingScrollScale = 0.3;
+static CFAbsoluteTime pendingSince, pendingUpdated;
 static BOOL scrollScheduled;
 static unsigned long scrollGeneration;
 static CFAbsoluteTime lastScrollTime;
+static CFAbsoluteTime lastMotionTime;
+static dispatch_queue_t scrollDeliveryQueue;
+static HvScrollPixelMapper pixelMapper;
+static double reportRawX, reportRawY, reportScale = 0.3, reportDelay;
+static long long reportX, reportY, reportPointX, reportPointY;
+static unsigned reportFrames, reportDropped;
+static CFAbsoluteTime reportStarted;
 
 static void postPixels(int x, int y, int phase) {
     /* Pixel units bypass the mouse driver's wheel acceleration. */
@@ -25,32 +35,80 @@ static void postPixels(int x, int y, int phase) {
     CGEventSetIntegerValueField(event, kCGScrollWheelEventIsContinuous, 1);
     CGEventSetIntegerValueField(event, kCGScrollWheelEventScrollPhase, phase);
     CGEventSetIntegerValueField(event, kCGScrollWheelEventMomentumPhase, 0);
+    if (x || y) {
+        reportPointX += CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis2);
+        reportPointY += CGEventGetIntegerValueField(event, kCGScrollWheelEventPointDeltaAxis1);
+    }
     CGEventPost(kCGHIDEventTap, event);
     CFRelease(event);
 }
 
-static void queuePixels(int x, int y) {
+static void reportScroll(CFAbsoluteTime now, BOOL force) {
+    if (!reportStarted) reportStarted = now;
+    if ((!force && now - reportStarted < 1) || (!reportFrames && !reportDropped)) return;
+    NSString *text = [NSString stringWithFormat:@"%.6f %.3f %.3f %lld %lld %lld %lld %u %.3f %u",
+                      reportScale, reportRawX, reportRawY, reportX, reportY, reportPointX, reportPointY,
+                      reportFrames, reportDelay, reportDropped];
+    NSData *body = [text dataUsingEncoding:NSUTF8StringEncoding];
+    reportRawX = reportRawY = reportDelay = 0;
+    reportX = reportY = reportPointX = reportPointY = 0;
+    reportFrames = reportDropped = 0;
+    reportStarted = now;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        int status = 0;
+        request(@"POST", @"/.henge/scroll-report", body, &status, NULL);
+    });
+}
+
+static void queueMotion(double x, double y, double scale) {
     if (!x && !y) return; /* stream heartbeat */
     [scrollLock lock];
     pendingScrollX = MAX(-64, MIN(64, pendingScrollX + x));
     pendingScrollY = MAX(-64, MIN(64, pendingScrollY + y));
+    pendingScrollScale = scale;
+    pendingUpdated = CFAbsoluteTimeGetCurrent();
     BOOL schedule = !scrollScheduled;
+    if (schedule) pendingSince = pendingUpdated;
     scrollScheduled = YES;
     [scrollLock unlock];
     if (!schedule) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 60), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 60), scrollDeliveryQueue, ^{
         [scrollLock lock];
-        int dx = MAX(-32, MIN(32, pendingScrollX)), dy = MAX(-32, MIN(32, pendingScrollY));
+        double rawX = pendingScrollX, rawY = pendingScrollY, gain = pendingScrollScale;
+        CFAbsoluteTime first = pendingSince, latest = pendingUpdated;
         pendingScrollX = pendingScrollY = 0;
         scrollScheduled = NO;
         [scrollLock unlock];
-        if (!dx && !dy) return;
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-        postPixels(dx, dy, now - lastScrollTime > 0.12 ? 1 : 2); /* began / changed */
+        if (now - latest > 0.1) {
+            reportDropped++;
+            pixelMapper = (HvScrollPixelMapper){0};
+            lastMotionTime = 0;
+            reportScroll(now, YES);
+            return;
+        }
+        if (reportFrames && reportScale != gain) reportScroll(now, YES);
+        reportScale = gain;
+        BOOL began = now - lastScrollTime > 0.12;
+        if (now - lastMotionTime > 0.12) pixelMapper = (HvScrollPixelMapper){0};
+        lastMotionTime = now;
+        reportRawX += rawX;
+        reportRawY += rawY;
+        reportFrames++;
+        reportDelay = MAX(reportDelay, (now - first) * 1000);
+        HvScrollPixelFrame frame = hv_scroll_pixels_apply(&pixelMapper, rawX, rawY, gain);
+        if (!frame.x && !frame.y) { reportScroll(now, NO); return; }
+        reportX += frame.x;
+        reportY += frame.y;
+        postPixels(frame.x, frame.y, began ? 1 : 2);
         lastScrollTime = now;
+        reportScroll(now, NO);
         unsigned long generation = ++scrollGeneration;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            if (scrollGeneration == generation) postPixels(0, 0, 4); /* ended, no synthesized momentum */
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC), scrollDeliveryQueue, ^{
+            if (scrollGeneration == generation) {
+                postPixels(0, 0, 4);
+                reportScroll(CFAbsoluteTimeGetCurrent(), YES);
+            }
         });
     });
 }
@@ -67,7 +125,7 @@ static void followScroll(void) {
             setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
             struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(80)};
             inet_pton(AF_INET, HOST, &addr.sin_addr);
-            static const char head[] = "GET /.henge/scroll HTTP/1.1\r\nHost: " HOST "\r\nConnection: close\r\n\r\n";
+            static const char head[] = "GET /.henge/scroll-v2 HTTP/1.1\r\nHost: " HOST "\r\nConnection: close\r\n\r\n";
             if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0 && send_all(fd, head, sizeof head - 1) == 0) {
                 NSMutableData *pending = [NSMutableData data];
                 BOOL headers = YES;
@@ -93,8 +151,10 @@ static void followScroll(void) {
                         NSRange end = [pending rangeOfData:[NSData dataWithBytes:"\n" length:1] options:0 range:NSMakeRange(0, pending.length)];
                         if (end.location == NSNotFound) break;
                         NSString *line = [[NSString alloc] initWithData:[pending subdataWithRange:NSMakeRange(0, end.location)] encoding:NSUTF8StringEncoding];
-                        int x = 0, y = 0;
-                        if (line && sscanf(line.UTF8String, "%d %d", &x, &y) == 2 && x >= -128 && x <= 128 && y >= -128 && y <= 128) queuePixels(x, y);
+                        double x = 0, y = 0, scale = 0;
+                        if (line && sscanf(line.UTF8String, "%lf %lf %lf", &x, &y, &scale) == 3 && isfinite(x) && isfinite(y) &&
+                            isfinite(scale) && x >= -64 && x <= 64 && y >= -64 && y <= 64 && scale >= 0.1 && scale <= 1.5)
+                            queueMotion(x, y, scale);
                         [pending replaceBytesInRange:NSMakeRange(0, NSMaxRange(end)) withBytes:NULL length:0];
                     }
                 }
@@ -219,6 +279,8 @@ static void keepMounted(void) {
 int main(void) {
     @autoreleasepool {
         scrollLock = [NSLock new];
+        scrollDeliveryQueue = dispatch_queue_create("com.henge.scroll-delivery",
+            dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0));
         AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)@{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES});
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ followScroll(); });
         lastChange = NSPasteboard.generalPasteboard.changeCount;
