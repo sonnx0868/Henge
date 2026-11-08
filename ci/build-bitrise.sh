@@ -9,6 +9,15 @@ HUSK_ROOT="$(dirname "$HENGE_ROOT")/Husk"
 STIKJIT_ROOT="$(dirname "$HENGE_ROOT")/StikJIT"
 HUSK_REV=afe83d45b31194c4cc9f7b3db7ec2c757db8346e
 
+# Source verification can use the existing manually configured workflow without
+# downloading dependencies or producing an IPA.
+if [[ "${HENGE_CHECK_ONLY:-0}" == 1 ]]; then
+    bash "$HENGE_ROOT/ci/check-integration.sh"
+    mkdir -p "${BITRISE_DEPLOY_DIR:?Bitrise must set BITRISE_DEPLOY_DIR}"
+    printf 'Integration checks passed for %s\n' "$(git -C "$HENGE_ROOT" rev-parse HEAD)" > "$BITRISE_DEPLOY_DIR/integration-check.txt"
+    exit 0
+fi
+
 # Exercise guest code changes and cache invalidation on the Mac build host before packaging iOS.
 cd "$HENGE_ROOT"
 # The native-vs-JIT harness keeps multi-megabyte HvCpu copies on the main stack.
