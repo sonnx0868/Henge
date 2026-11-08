@@ -71,10 +71,9 @@ struct InstallView: View {
                 Text("Memory").font(.system(size: 16))
                 Spacer()
                 Picker("Memory", selection: $ramGB) {
-                    ForEach([4, 6, 8], id: \.self) { Text("\($0) GB").tag($0) }
+                    ForEach(Device.memoryChoicesGB, id: \.self) { Text("\($0) GB").tag($0) }
                 }
-                .pickerStyle(.segmented)
-                .frame(width: 190)
+                .pickerStyle(.menu)
             }
             .padding(.horizontal, 17)
             .padding(.vertical, 10)

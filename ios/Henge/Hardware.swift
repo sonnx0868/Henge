@@ -28,6 +28,13 @@ enum Device {
         return mb >= 10_000 ? 8 : mb >= 7_000 ? 6 : 4
     }
 
+    /// Larger guests are an explicit choice on devices sold with 16 GB RAM.
+    /// Leave the suggested size unchanged until workload measurements justify it.
+    static var memoryChoicesGB: [Int] {
+        let mb = ProcessInfo.processInfo.physicalMemory >> 20
+        return mb >= 14_000 ? [4, 6, 8, 10, 12] : [4, 6, 8]
+    }
+
     /// The virtual CPU offers Armv8.5 instructions (core/sysreg.c), and macOS uses them. They run as
     /// they are, so the chip needs them too: A14, M1 and later, which is iPhone13,x and iPad13,x up.
     static let chipTooOld: Bool = {
