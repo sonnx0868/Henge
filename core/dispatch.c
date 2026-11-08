@@ -615,7 +615,10 @@ static void print_stats(HvCpu *cpu, int force) {
         mach_port_deallocate(mach_task_self(), self);
         fprintf(stderr, "  cache drops/s: full %.0f, ASID %.0f, user VA %.0f, kernel VA %.0f, code %.0f (whole user half %.0f, filter full %.0f, big user range %.0f)\n", RATE(reset_why[0]),
                 RATE(reset_why[1]), RATE(reset_why[2]), RATE(reset_why[3]), RATE(reset_why[4]), RATE(reset_why[5]), RATE(reset_why[6]), RATE(reset_why[7]));
-        { /* block hash health: chain lengths and how much of it is stale */
+        /* Walking millions of blocks here stalls this guest CPU and evicts
+           its working set. Routine sampling skips this cache inventory;
+           request it explicitly when investigating cache health. */
+        if (getenv("HV_HASH_STATS")) { /* block hash health: chain lengths and how much of it is stale */
             uint64_t used = 0, stale = 0, maxlen = 0, sumsq = 0;
             uint32_t worst = 0;
             for (uint32_t h = 0; h < HV_BLOCK_HASH; h++) {

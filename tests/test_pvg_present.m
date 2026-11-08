@@ -71,11 +71,11 @@ void hv_pvg_lite_complete(HvPvgLite *p, uint32_t c, uint32_t s) { stamps++; }
 @interface TestReplay : HvReplay {
 @public
     unsigned displayed;
-    HvObject *resource;
+    HvObject *resource, *aliasResource;
 }
 @end
 @implementation TestReplay
-- (HvObject *)object:(uint32_t)ref task:(uint32_t)task { return ref == 1 ? resource : nil; }
+- (HvObject *)object:(uint32_t)ref task:(uint32_t)task { return ref == 1 ? resource : ref == 2 ? aliasResource : nil; }
 /* Keep the real dirty flag, lock and kickPresenter; replace only Metal drawing. */
 - (void)presentLoop {
     os_unfair_lock_lock(&screen_lock);
@@ -178,7 +178,51 @@ int main(void) {
             assert(r->displayed == 4);
         }
         assert(!r->screen_dirty && !r->presenter_running);
+        /* Real two-plane IOSurface, two resource views: the production exec
+           must inspect/upload once, then recheck on the next submission. */
+        HvObject *video = [HvObject new];
+        uint8_t descriptor[0x200] = {0};
+        uint32_t fourcc = '420v';
+        uint64_t width = 64, height = 64;
+        memcpy(descriptor + 4, &fourcc, 4);
+        memcpy(descriptor + 0x20, &width, 8);
+        memcpy(descriptor + 0x28, &height, 8);
+        descriptor[0x3e] = 2;
+        for (unsigned plane = 0; plane < 2; plane++) {
+            uint8_t *d = descriptor + 0x80 + plane * 0x80;
+            uint64_t offset = plane ? 4096 : 0, bytes = plane ? 2048 : 4096;
+            uint64_t w = plane ? 32 : 64, h = w, row = 64;
+            uint16_t element = plane ? 2 : 1;
+            memcpy(d + 8, &offset, 8); memcpy(d + 0x18, &bytes, 8);
+            memcpy(d + 0x20, &w, 8); memcpy(d + 0x28, &h, 8);
+            memcpy(d + 0x30, &row, 8); memcpy(d + 0x38, &element, 2);
+        }
+        video->alloc = 6144;
+        video->length = 16384;
+        vm_address_t pixels = 0;
+        assert(vm_allocate(mach_task_self(), &pixels, video->length, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+        video->mapped = (uint8_t *)pixels;
+        video->iosurface = make_iosurface(video, descriptor, video->alloc);
+        assert(video->iosurface);
+        r->resource->surface = video;
+        r->aliasResource = [HvObject new];
+        r->aliasResource->surface = video;
+        uint32_t video_exec[] = {0, 2, 0, 1, 1, 2, 1};
+        for (unsigned frame = 0; frame < 3; frame++) {
+            if (frame < 2) video->mapped[0] = (uint8_t)(frame + 1);
+            q.next = [TestCB new];
+            assert([r exec:video_exec length:sizeof video_exec channel:1 stamp:20 + frame]);
+            [q.next finish:YES];
+            assert(r->video_deduplicated == frame + 1);
+            assert(r->video_uploads == (frame ? 2 : 1));
+            assert(r->video_skips == (frame == 2 ? 1 : 0));
+            assert(!r->video_copy_failures);
+            assert(*(uint8_t *)IOSurfaceGetBaseAddressOfPlane(video->iosurface, 0) == (frame ? 2 : 1));
+        }
+        dispatch_sync(r->presenter, ^{});
+        assert(r->displayed == 4 && !r->screen_dirty && !r->presenter_running);
         puts("PVG present: actual scanout attachments wake after successful completion without resource write flags or input; offscreen/read-only work and failed jobs stay idle");
+        puts("PVG video: aliased plane resources check once per exec; changed and unchanged submissions are rechecked");
     }
     return 0;
 }

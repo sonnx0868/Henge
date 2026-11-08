@@ -210,6 +210,48 @@ PROGRAM atomics
     cas x18, x28, [x28]
 END atomics
 
+// CASP: implicit pair partners must stay live across address translation.
+// Test success/failure, both widths, all memory orders, overlapping operands,
+// SP addressing, and pairs that must retain the C helper fallback.
+PROGRAM casp_pairs
+    add x24, x0, #512
+    mov x8, #11
+    mov x9, #22
+    mov x10, #33
+    mov x11, #44
+    stp x8, x9, [x24]
+    casp x8, x9, x10, x11, [x24]
+    caspa x8, x9, x10, x11, [x24] // failure updates both compare registers
+    caspl x8, x9, x8, x9, [x24]  // overlapping compare/desired pairs
+    caspal x8, x9, x10, x11, [x24]
+    stp w8, w9, [x24]
+    casp w8, w9, w10, w11, [x24]
+    caspa w8, w9, w10, w11, [x24]
+    caspl w8, w9, w8, w9, [x24]
+    caspal w8, w9, w10, w11, [x24]
+    // Warm writable RAM and repeat a common ordinary pair without helpers.
+    mov x2, #51
+    mov x3, #52
+    stp x2, x3, [x24]
+    mov x20, #128
+1:  caspal x2, x3, x2, x3, [x24]
+    subs x20, x20, #1
+    b.ne 1b
+    // Base aliases a compare register. It must be copied before CASP writes it.
+    mov x2, x24
+    stp x2, x3, [x24]
+    casp x2, x3, x10, x11, [x2]
+    sub sp, sp, #32
+    stp x8, x9, [sp]
+    casp x8, x9, x10, x11, [sp]
+    add sp, sp, #32
+    // Pair starts OR partners in x6/x7, x14/x15, x18/x19, x28/x29.
+    casp x6, x7, x10, x11, [x24]
+    casp x8, x9, x14, x15, [x24]
+    casp x18, x19, x10, x11, [x24]
+    casp x8, x9, x28, x29, [x24]
+END casp_pairs
+
 PROGRAM literal
     ldr x1, lit64
     ldr w2, lit64

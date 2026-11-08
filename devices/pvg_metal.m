@@ -91,6 +91,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     IOSurfaceRef iosurface;
     uint64_t alloc, content_hash;
     BOOL content_valid;
+    uint64_t video_sync_exec; /* one coherent upload/check per guest exec, across plane views */
     /* Source layout for a multi-plane video surface. */
     uint32_t plane_count;
     uint64_t plane_from[4], plane_row[4], plane_h[4], plane_bytes[4];
@@ -128,6 +129,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     NSMutableSet<NSString *> *video_view_layouts;
     uint64_t execs, draws, failed, heap_bytes, synced, remaps;
     uint64_t video_uploads, video_skips, video_fences, video_copy_failures;
+    uint64_t resource_sync_exec, video_deduplicated;
     double video_wait_time;
     /* Work the GPU has not finished. Stamps are given back in the order they came: the
        GPU's completion handlers run in the order of commit. */
@@ -637,8 +639,8 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
 }
 
 /* Guest pixels into its IOSurface, when they changed. A sample of every 64th byte says so cheaply. */
-static void sync_iosurface(HvReplay *r, HvObject *s) {
-    if (!s->iosurface) return;
+static BOOL sync_iosurface(HvReplay *r, HvObject *s) {
+    if (!s->iosurface) return YES;
     const uint8_t *from = s->mapped + s->first;
     uint64_t hash = 0xcbf29ce484222325ull;
     for (uint64_t i = 0; i + 8 <= s->alloc; i += 64) {
@@ -646,7 +648,7 @@ static void sync_iosurface(HvReplay *r, HvObject *s) {
         memcpy(&v, from + i, 8);
         hash = (hash ^ v) * 0x100000001b3ull;
     }
-    if (s->content_valid && hash == s->content_hash) { r->video_skips++; return; }
+    if (s->content_valid && hash == s->content_hash) { r->video_skips++; return YES; }
     /* CPU writes to Shared IOSurface storage must not overlap an older GPU
        command buffer sampling it. The serial Metal queue's last buffer covers
        all earlier readers; only changed video uploads need this fence. */
@@ -659,7 +661,7 @@ static void sync_iosurface(HvReplay *r, HvObject *s) {
     if (IOSurfaceLock(s->iosurface, 0, NULL) != KERN_SUCCESS) {
         r->video_copy_failures++;
         [r complain:@"video IOSurface lock failed"];
-        return;
+        return NO;
     }
     BOOL valid = YES;
     if (s->plane_count && IOSurfaceGetPlaneCount(s->iosurface) >= s->plane_count) {
@@ -686,7 +688,7 @@ static void sync_iosurface(HvReplay *r, HvObject *s) {
     if (!valid) {
         r->video_copy_failures++;
         [r complain:[NSString stringWithFormat:@"video plane layout invalid: fourcc %08x %ux%u", s->fourcc, s->surface_w, s->surface_h]];
-        return;
+        return NO;
     }
     s->content_hash = hash;
     s->content_valid = YES;
@@ -699,6 +701,7 @@ static void sync_iosurface(HvReplay *r, HvObject *s) {
         FILE *f = fopen(path, "wb");
         if (f) fwrite(from, 1, s->alloc, f), fclose(f);
     }
+    return YES;
 }
 
 /* A surface (IOSurface in the guest): a texture over its guest pages, so the
@@ -1750,6 +1753,7 @@ typedef struct {
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = nil;
     BOOL sync_after = NO;
+    uint64_t sync_exec = ++resource_sync_exec;
     for (uint32_t i = 0; i < nres; i++) {
         HvObject *o = [self object:res[i * 2] task:task];
         if (!o) continue;
@@ -1760,7 +1764,14 @@ typedef struct {
             }
         }
         if (o->mapped) refresh_pages(self, task, o);
-        if (o->surface) sync_iosurface(self, o->surface);
+        /* Y, UV, and combined texture views can all name the same video
+           surface. Hash/copy/fence it once for this submission. A new exec
+           always checks again; failed uploads remain eligible for retry. */
+        HvObject *surface = o->surface;
+        if (surface && surface->iosurface) {
+            if (surface->video_sync_exec == sync_exec) video_deduplicated++;
+            else if (sync_iosurface(self, surface)) surface->video_sync_exec = sync_exec;
+        }
         if (getenv("HV_PVG_TALLY") && (o->entry[0] & 0xff) == OBJ_MAPPED_TEXTURE) {
             static uint32_t seen[256];
             uint32_t f = res[i * 2 + 1] & 0xff, key = res[i * 2] & 0xff;
@@ -1872,6 +1883,7 @@ typedef struct {
         fprintf(stderr, "hengevm: video uploads %llu unchanged %llu fenced %llu copy failures %llu GPU fence wait %.3f s\n",
                 (unsigned long long)video_uploads, (unsigned long long)video_skips, (unsigned long long)video_fences,
                 (unsigned long long)video_copy_failures, video_wait_time);
+        fprintf(stderr, "hengevm: video duplicate plane checks avoided %llu\n", (unsigned long long)video_deduplicated);
         fprintf(stderr, "hengevm: display swaps %llu GPU redraw completions %llu\n",
                 (unsigned long long)screen_swaps, (unsigned long long)atomic_load(&gpu_redraws));
         encode_time = gpu_wait_time = 0;

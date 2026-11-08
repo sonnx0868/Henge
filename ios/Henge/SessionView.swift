@@ -538,17 +538,23 @@ struct SessionView: View {
         var tick = 0
         while !Task.isCancelled {
             state = henge_vm_state()
-            cpusOn = henge_vm_cpus_on()
             userCode = userCode || henge_vm_guest_el0() != 0
             let now = Date(), blocks = henge_vm_blocks()
-            blocksPerSecond = Double(blocks &- lastBlocks) / max(now.timeIntervalSince(lastTime), 0.001)
+            let blockRate = Double(blocks &- lastBlocks) / max(now.timeIntervalSince(lastTime), 0.001)
             lastBlocks = blocks
             lastTime = now
-            framesOut = henge_vm_net_frames(1)
-            framesIn = henge_vm_net_frames(0)
+            let txFrames = henge_vm_net_frames(1), rxFrames = henge_vm_net_frames(0)
             helperRunning = Sharing.helperRunning
             pixelScrollReady = henge_vm_pixel_scroll_ready() != 0
-            log = Array(HengeLog.recentLines(200))
+            // Hidden Details must not copy logs and invalidate the screen view
+            // once a second while the user is interacting with the Mac.
+            if showDetails {
+                cpusOn = henge_vm_cpus_on()
+                blocksPerSecond = blockRate
+                framesOut = txFrames
+                framesIn = rxFrames
+                log = HengeLog.recentLines(30)
+            }
             let heat = ProcessInfo.processInfo.thermalState
             if heat.rawValue != thermalState.rawValue {
                 thermalState = heat
@@ -559,8 +565,8 @@ struct SessionView: View {
             if tick % 10 == 0 {
                 let gpuFrames = henge_vm_gpu_frames()
                 let audioUnderruns = henge_vm_audio_underruns()
-                HengeLog.log("perf", "blocks/s \(String(format: "%.0f", blocksPerSecond)), GPU frames/10s \(gpuFrames &- lastGPUFrames), "
-                             + "network tx \(framesOut), rx \(framesIn), thermal \(Self.thermalLabel(heat)), "
+                HengeLog.log("perf", "blocks/s \(String(format: "%.0f", blockRate)), GPU frames/10s \(gpuFrames &- lastGPUFrames), "
+                             + "network tx \(txFrames), rx \(rxFrames), thermal \(Self.thermalLabel(heat)), "
                              + "audio underruns/10s \(audioUnderruns &- lastAudioUnderruns), queued \(henge_vm_audio_queued_bytes()) bytes")
                 Sharing.writeDiagnostics([
                     "schemaVersion": 1, "timestamp": ISO8601DateFormatter().string(from: now),

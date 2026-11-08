@@ -10,6 +10,7 @@ DECLARE_PROGRAM(pairs);
 DECLARE_PROGRAM(simd_mem);
 DECLARE_PROGRAM(exclusive);
 DECLARE_PROGRAM(atomics);
+DECLARE_PROGRAM(casp_pairs);
 DECLARE_PROGRAM(literal);
 DECLARE_PROGRAM(loops);
 DECLARE_PROGRAM(epilogue);
@@ -23,6 +24,7 @@ static const TestProgram programs[] = {
     TEST_PROGRAM(single), TEST_PROGRAM(stolen_mem), TEST_PROGRAM(pairs),   TEST_PROGRAM(simd_mem),
     TEST_PROGRAM(exclusive), TEST_PROGRAM(atomics),  TEST_PROGRAM(literal), TEST_PROGRAM(loops), TEST_PROGRAM(epilogue),
     TEST_PROGRAM(dczva), TEST_PROGRAM(pageend), TEST_PROGRAM(groups),
+    TEST_PROGRAM(casp_pairs),
 };
 
 #define DATA_SIZE 65536
@@ -176,6 +178,10 @@ int main(void) {
             m.stat_slow_mem = 0;
             int bad = run_jit(&m, p, &init, &jit, mode == 2 ? mmu_on : NULL);
             if (!bad) bad = compare_cpus(p->name, &native, &jit);
+            if (!bad && mode && strcmp(p->name, "casp_pairs") == 0 && m.stat_slow_mem >= 128) {
+                printf("  casp_pairs: ordinary RAM loop still takes the helper path\n");
+                bad = 1;
+            }
             for (size_t off = 0; off < DATA_SIZE && !bad; off += 8)
                 if (memcmp(native_data + off, data + off, 8) != 0) {
                     uint64_t a, b;

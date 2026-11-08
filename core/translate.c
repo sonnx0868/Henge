@@ -881,14 +881,20 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
         translate_excl(e, insn, pc);
         return;
     }
-    if (e->slow_mem || op.kind == HV_MEM_EXCL || op.kind == HV_MEM_CASP) {
+    /* CASP uses implicit adjacent registers as well as Rs/Rt. Keep pairs
+       containing virtualized host registers on the helper path; ordinary
+       pairs can use the same checked host-address path as scalar atomics. */
+    int casp = op.kind == HV_MEM_CASP;
+    int casp_stolen = casp && (is_stolen(op.rs) || is_stolen(op.rs + 1) ||
+                               is_stolen(op.rt) || is_stolen(op.rt + 1));
+    if (e->slow_mem || op.kind == HV_MEM_EXCL || casp_stolen) {
         put_helper(e, pc, insn, HV_OP_MEM);
         return;
     }
     int literal = op.mode == HV_ADDR_LITERAL;
     int vec_kind = op.kind == HV_MEM_VEC_MULTI || op.kind == HV_MEM_VEC_SINGLE;
     int pair = op.kind == HV_MEM_PAIR;
-    int rmw = op.kind == HV_MEM_CAS || op.kind == HV_MEM_ATOMIC;
+    int rmw = op.kind == HV_MEM_CAS || op.kind == HV_MEM_ATOMIC || casp;
     int rm_used = op.mode == HV_ADDR_REG || (vec_kind && op.mode == HV_ADDR_POST && op.rm != 31);
 
     uint32_t used = 0;
@@ -896,6 +902,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     if (!op.vec) used |= 1u << op.rt | (pair ? 1u << op.rt2 : 0);
     if (rm_used) used |= 1u << op.rm;
     if (rmw) used |= 1u << op.rs;
+    if (casp) used |= 1u << (op.rs + 1) | 1u << (op.rt + 1);
     /* Guest x6, x7 and x15 live in the HvCpu: their host registers are as free as ever. */
     if (!hv_knob[HV_K_TEST3]) used &= ~(1u << 6 | 1u << 7 | 1u << 15);
     uint8_t s[3];
@@ -1075,7 +1082,7 @@ static void translate_mem(Emit *e, uint32_t insn, uint64_t pc) {
     case HV_MEM_VEC_SINGLE:
         out = (insn & ~(1u << 23) & ~(0x1fu << 16) & ~(0x1fu << 5)) | A << 5;
         break;
-    default: /* ORDERED, CAS, ATOMIC: same instruction on the host address */
+    default: /* ORDERED, CAS, CASP, ATOMIC: same instruction on the host address */
         out = (insn & ~(0x1fu << 5) & ~0x1fu) | A << 5 | rt;
         if ((insn & 0x3f200c00) == 0x19000000) out &= ~(0x1ffu << 12); /* LDAPUR/STLUR: drop imm9 */
         if (rmw) out = (out & ~(0x1fu << 16)) | rs << 16;
@@ -1791,6 +1798,7 @@ static void plan_groups(Emit *e, const uint32_t *code, uint32_t max, uint64_t va
         /* Another load or store: what it may write. */
         if (op.load && !op.vec) KILL(op.rt), KILL(op.rt2);
         KILL(op.rs);
+        if (op.kind == HV_MEM_CASP) KILL(op.rs + 1); /* implicit compare-pair output */
         if (op.mode == HV_ADDR_PRE || op.mode == HV_ADDR_POST || op.mode == HV_ADDR_REG) KILL(op.rn);
         if (op.kind == HV_MEM_VEC_MULTI || op.kind == HV_MEM_VEC_SINGLE) KILL(op.rn);
     }
