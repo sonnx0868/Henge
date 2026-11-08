@@ -55,7 +55,7 @@ $(B)/henge-agent: tools/henge-agent.m tools/scroll_pixels.h tools/scroll_wheel.h
 $(B)/henge-agent.gz: $(B)/henge-agent
 	gzip -9 -n -c $< > $@
 
-$(B)/share.o: host/share.c host/share.h
+$(B)/share.o: host/share.c host/share.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/share.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a
