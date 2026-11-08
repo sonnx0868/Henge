@@ -16,6 +16,18 @@ enum Sharing {
         // A Unix socket's path can't be long, so the short temporary folder.
         let socket = (NSTemporaryDirectory() as NSString).appendingPathComponent("s.sock")
         henge_vm_share(folder.path, socket, Bundle.main.path(forResource: "henge-agent", ofType: "gz"))
+        // Do not present a previous session's measurements as current.
+        try? FileManager.default.removeItem(at: diagnosticsURL)
+    }
+
+    private static var diagnosticsURL: URL { folder.appendingPathComponent(".henge-diagnostics.json") }
+
+    /// Opt-in measurements only, readable inside this Mac through its existing
+    /// shared folder. No key presses, clipboard contents, URLs or account data.
+    @MainActor static func writeDiagnostics(_ metrics: [String: Any]) {
+        guard UserDefaults.standard.bool(forKey: "henge.performanceDiagnostics"),
+              let data = try? JSONSerialization.data(withJSONObject: metrics, options: [.sortedKeys]) else { return }
+        try? data.write(to: diagnosticsURL, options: .atomic)
     }
 
     /// The helper asks the server for news at most 25 s apart.

@@ -59,7 +59,7 @@ struct SettingsView: View {
                 }
                 Section("Log") {
                     Toggle("Performance diagnostics", isOn: $performanceDiagnostics)
-                    Text("Logs CPU, JIT and network queue statistics every 15 seconds while a Mac runs. Turn on before starting the Mac; turn off after the test.")
+                    Text("Logs CPU, JIT and network queue statistics, and saves local temperature and scroll measurements in Shared for the Mac to read. Turn on before starting the Mac; turn off after the test.")
                         .font(.footnote).foregroundStyle(.secondary)
                     ShareLink(item: HengeLog.logFileURL) { Label("Share henge.log", systemImage: "square.and.arrow.up") }
                 }

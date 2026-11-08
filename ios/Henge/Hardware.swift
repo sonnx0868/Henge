@@ -151,6 +151,7 @@ final class HardwareMouse: ObservableObject {
     private var speed: Float = 1
     private var reverse = false
     private var scrollDiagnostics = false
+    private(set) var recentScrollSamples: [[String: Any]] = []
     private var running = false
     private var secondaryClick = SecondaryClickRouting()
     private var buttonLogs = [0, 0, 0]
@@ -164,6 +165,7 @@ final class HardwareMouse: ObservableObject {
         speed = defaults.object(forKey: Self.speedKey) == nil ? 1 : Float(defaults.double(forKey: Self.speedKey))
         reverse = defaults.bool(forKey: Self.reverseKey)
         scrollDiagnostics = defaults.bool(forKey: "henge.performanceDiagnostics")
+        recentScrollSamples.removeAll(keepingCapacity: true)
         secondaryClick.reset()
         buttonLogs = [0, 0, 0]
         uiKitButtonLogs = 0
@@ -331,6 +333,11 @@ final class HardwareMouse: ObservableObject {
             state.frameLogs = 0
         }
         state.lastTime = now
+        if scrollDiagnostics && horizontal.isFinite && vertical.isFinite {
+            recentScrollSamples.append(["uptime": now, "device": device.name, "kind": state.kind.rawValue,
+                                        "rawX": horizontal, "rawY": vertical])
+            if recentScrollSamples.count > 128 { recentScrollSamples.removeFirst(recentScrollSamples.count - 128) }
+        }
         state.motion.append(x: horizontal, y: vertical)
         if scrollDiagnostics && state.rawLogs < 24 {
             state.rawLogs += 1
