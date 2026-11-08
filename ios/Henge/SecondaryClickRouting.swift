@@ -1,10 +1,12 @@
 /// UIKit and GameController may describe the same physical secondary click.
 /// Retain complete down/up pairs while suppressing duplicates across the two APIs.
 struct SecondaryClickRouting {
+    enum UIKitSource: String { case tap, contextMenu }
     private(set) var held = false
     private var suppressControllerPair = false
     private var lastController = -Double.infinity
     private var lastUIKit = -Double.infinity
+    private var lastUIKitSource: UIKitSource?
     private let overlap = 0.12
 
     mutating func controller(pressed: Bool, now: Double) -> [Bool] {
@@ -29,9 +31,11 @@ struct SecondaryClickRouting {
         return [false]
     }
 
-    mutating func uiKitClick(now: Double) -> [Bool] {
+    mutating func uiKitClick(now: Double, source: UIKitSource = .tap) -> [Bool] {
         guard !held, now - lastController >= overlap else { return [] }
+        if lastUIKitSource != source && now - lastUIKit < overlap { return [] }
         lastUIKit = now
+        lastUIKitSource = source
         return [true, false]
     }
 

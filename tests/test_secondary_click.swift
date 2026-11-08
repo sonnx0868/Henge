@@ -18,6 +18,12 @@ struct SecondaryClickTests {
         precondition(route.controller(pressed: true, now: 4.1) == [true])
         route.reset()
         precondition(!route.held && route.uiKitClick(now: 4.11) == [true, false], "reset clears stale held state")
+        route.reset()
+        precondition(route.uiKitClick(now: 5, source: .contextMenu) == [true, false], "a menu request alone forwards a secondary click")
+        precondition(route.uiKitClick(now: 5.02, source: .tap).isEmpty, "tap and menu callbacks must not double the same click")
+        precondition(route.uiKitClick(now: 5.05, source: .contextMenu) == [true, false], "rapid clicks through the same UIKit route stay valid")
+        precondition(route.controller(pressed: true, now: 5.06).isEmpty)
+        precondition(route.controller(pressed: false, now: 5.07).isEmpty)
         print("secondary click: controller/UIKit delivery, duplicate ordering, holds, rapid clicks and reset passed")
     }
 }

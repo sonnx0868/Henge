@@ -327,10 +327,10 @@ final class HardwareMouse: ObservableObject {
         }
     }
 
-    func secondaryClickFromUIKit() {
+    func secondaryClickFromUIKit(source: SecondaryClickRouting.UIKitSource = .tap) {
         guard running else { return }
         recordButton(1, true, source: "UIKit", stage: "received")
-        let events = secondaryClick.uiKitClick(now: ProcessInfo.processInfo.systemUptime)
+        let events = secondaryClick.uiKitClick(now: ProcessInfo.processInfo.systemUptime, source: source)
         if scrollDiagnostics && uiKitButtonLogs < 32 {
             uiKitButtonLogs += 1
             HengeLog.log("input", "mouse secondary UIKit: \(events.isEmpty ? "duplicate suppressed" : "forwarded")")
