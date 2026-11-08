@@ -9,6 +9,8 @@
 
    Locks are accepted but not enforced: macOS only writes to a server that offers them, and there is one client. */
 #include "share.h"
+#include "image_ops.h"
+#include <stdatomic.h>
 
 #include <copyfile.h>
 #include <dirent.h>
@@ -37,6 +39,9 @@
 
 static char root[PATH_MAX];
 static char agent_path[PATH_MAX];
+static _Atomic(HvShareImageProcessor) image_processor;
+static pthread_mutex_t image_mu = PTHREAD_MUTEX_INITIALIZER;
+void hv_share_set_image_processor(HvShareImageProcessor p) { atomic_store(&image_processor, p); }
 
 /* ---- the clipboard ---- */
 
@@ -301,13 +306,13 @@ static int body_discard(Conn *c, Request *r) {
     }
 }
 
-static char *body_small(Conn *c, Request *r, size_t *len) {
+static char *body_limited(Conn *c, Request *r, size_t *len, size_t maximum) {
     Text t = {0};
     char piece[16384];
     body_ready(c, r);
     for (;;) {
         ssize_t got = body_read(c, r, piece, sizeof piece);
-        if (got < 0 || t.len + (size_t)got > SMALL_BODY_MAX) {
+        if (got < 0 || t.len + (size_t)got > maximum) {
             free(t.s);
             return NULL;
         }
@@ -317,6 +322,9 @@ static char *body_small(Conn *c, Request *r, size_t *len) {
     add(&t, "", 0);
     *len = t.len;
     return t.s;
+}
+static char *body_small(Conn *c, Request *r, size_t *len) {
+    return body_limited(c, r, len, SMALL_BODY_MAX);
 }
 
 static int respond(Conn *c, Request *r, int status, const char *reason, const char *headers, const char *body, size_t len) {
@@ -795,8 +803,40 @@ static int scroll_report(Conn *c, Request *r) {
     return respond_empty(c, r, 204, "No Content");
 }
 
+static int serve_native_image(Conn *c, Request *r, int capability) {
+    HvShareImageProcessor process = atomic_load(&image_processor);
+    if (!process) { r->close = 1; return respond_empty(c, r, 503, "Unavailable"); }
+    if (capability && !strcmp(r->method, "GET")) {
+        if (body_discard(c, r) != 0) return -1;
+        static const char caps[] = "{\"protocol\":1,\"backend\":\"native-imageio\",\"operations\":[\"prepare\",\"analyze\"],\"maxInputBytes\":33554432,\"maxPixels\":24000000}";
+        return respond(c, r, 200, "OK", "Content-Type: application/json\r\nCache-Control: no-store\r\n", caps, sizeof caps - 1);
+    }
+    r->close = 1; /* binary upload/response: never reinterpret leftover body bytes as another request */
+    if (capability || strcmp(r->method, "POST")) return respond_empty(c, r, 405, "Method Not Allowed");
+    int extension, pad, analyze, end = 0;
+    if (sscanf(r->query, "extension=%d&pad=%d&analyze=%d%n", &extension, &pad, &analyze, &end) != 3
+        || r->query[end] || extension < 0 || extension > 1 || pad < 0 || pad > 1 || analyze < 0 || analyze > 1)
+        return respond_empty(c, r, 400, "Bad Request");
+    if (r->length < 0 || (unsigned long long)r->length > HV_IMAGE_INPUT_MAX) return respond_empty(c, r, 413, "Too Large");
+    if (pthread_mutex_trylock(&image_mu) != 0) return respond_empty(c, r, 429, "Busy");
+    size_t length = 0, out_length = 0;
+    uint8_t *out = NULL;
+    char *body = body_limited(c, r, &length, HV_IMAGE_INPUT_MAX);
+    int status = body && length ? process((const uint8_t *)body, length, extension, pad, analyze, &out, &out_length) : 413;
+    free(body);
+    if (status == 200 && (!out || out_length < 4 || out_length > HV_IMAGE_OUTPUT_MAX)) status = 500;
+    int result = respond(c, r, status, status == 200 ? "OK" : "Image Processing Failed",
+        "Content-Type: application/x-henge-image-v1\r\nCache-Control: no-store\r\n", status == 200 ? (const char *)out : NULL,
+        status == 200 ? out_length : 0);
+    free(out);
+    pthread_mutex_unlock(&image_mu);
+    return result;
+}
+
 static int serve_henge(Conn *c, Request *r) {
     const char *what = r->path + strlen("/.henge/");
+    if (!strcmp(what, "image/v1")) return serve_native_image(c, r, 1);
+    if (!strcmp(what, "image/v1/prepare")) return serve_native_image(c, r, 0);
     if (!strcmp(what, "install") && !strcmp(r->method, "GET")) {
         if (body_discard(c, r) != 0) return -1;
         return respond(c, r, 200, "OK", "Content-Type: text/plain\r\n", install_script, sizeof install_script - 1);

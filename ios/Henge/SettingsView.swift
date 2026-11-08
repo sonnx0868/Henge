@@ -7,6 +7,7 @@ struct SettingsView: View {
     @AppStorage(HardwareMouse.reverseKey) private var reverseScrolling = false
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
     @AppStorage("henge.performanceDiagnostics") private var performanceDiagnostics = false
+    @AppStorage("henge.nativeImages") private var nativeImages = true
     @AppStorage(HardwareKeys.alternateCommandKey) private var alternateCommand = false
     @AppStorage(EngineTuning.refreshKey) private var refreshRate = 60
     @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = true
@@ -67,6 +68,9 @@ struct SettingsView: View {
                     .listRowBackground(Desk.card)
                 }
                 Section("Performance") {
+                    Toggle("Native image processing", isOn: $nativeImages)
+                    Text("Compatible Mac apps can process images directly on the iPad. Applies the next time a Mac starts.")
+                        .font(.footnote).foregroundStyle(.secondary)
                     Picker("Mac refresh rate", selection: $refreshRate) {
                         Text("30 Hz").tag(30)
                         Text("60 Hz").tag(60)

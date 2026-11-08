@@ -87,6 +87,10 @@ targets:
           - "AVFAudio"
           - "-framework"
           - "CoreFoundation"
+          - "-framework"
+          - "ImageIO"
+          - "-framework"
+          - "CoreGraphics"
     dependencies:
       # Built-in StikJIT's debugger process. Embedded into PlugIns/.
       - target: HengeJITHelper

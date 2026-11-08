@@ -1,5 +1,6 @@
 #include "pvg_lite.h"
 #include "share.h"
+#include "image_service.h"
 #include "net_slirp.h"
 #include <sys/mman.h>
 #include "henge-vm.h"
@@ -156,6 +157,7 @@ int henge_vm_guest_el0(void) {
     return 0;
 }
 
+void henge_vm_set_native_images(int enabled) { hv_share_set_image_processor(enabled ? hv_native_image_process : NULL); }
 void henge_vm_share(const char *folder, const char *socket_path, const char *agent) {
     if (hv_share_start(folder, socket_path, agent) == 0) hv_net_set_share_socket(socket_path);
 }

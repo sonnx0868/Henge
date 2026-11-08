@@ -36,5 +36,8 @@ done
 
 # Compile the native bridge too; Swift checking its header does not check the C implementation.
 xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot "$IOS_SDK" \
+  -std=c11 -Wall -Wextra -Werror -fobjc-arc -Ihost \
+  -c host/image_service.m -o "$OUT/image-service-ios.o"
+xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=17.0 -isysroot "$IOS_SDK" \
   -std=c11 -Wall -Wextra -Werror -Icore -Ihost -Idevices \
   -c ios/Henge/Native/henge-vm.c -o "$OUT/henge-vm-ios.o"

@@ -12,6 +12,7 @@ enum Sharing {
 
     /// Before a Mac starts.
     static func prepare() {
+        henge_vm_set_native_images(UserDefaults.standard.object(forKey: "henge.nativeImages") as? Bool == false ? 0 : 1)
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         // A Unix socket's path can't be long, so the short temporary folder.
         let socket = (NSTemporaryDirectory() as NSString).appendingPathComponent("s.sock")

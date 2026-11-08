@@ -55,7 +55,7 @@ $(B)/henge-agent: tools/henge-agent.m tools/scroll_pixels.h tools/scroll_wheel.h
 $(B)/henge-agent.gz: $(B)/henge-agent
 	gzip -9 -n -c $< > $@
 
-$(B)/share.o: host/share.c host/share.h | $(B)
+$(B)/share.o: host/share.c host/share.h host/image_ops.h | $(B)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(B)/hengevm: host/main.c $(ENGINE) $(DEV) $(B)/pvg_mac.o $(B)/net_slirp.o $(B)/share.o $(B)/audio_mac.o $(B)/vm.o $(B)/usb_host.o $(B)/mac-restore/libhengerestore.a
@@ -87,6 +87,10 @@ $(B)/test_code_links: tests/test_code_links.c $(ENGINE)
 	$(CC) $(CFLAGS) tests/test_code_links.c $(ENGINE) -o $@
 $(B)/test_scroll_bridge: tests/test_scroll_bridge.c $(B)/share.o
 	$(CC) $(CFLAGS) tests/test_scroll_bridge.c $(B)/share.o -o $@
+$(B)/test_image_bridge: tests/test_image_bridge.c $(B)/share.o
+	$(CC) $(CFLAGS) tests/test_image_bridge.c $(B)/share.o -o $@
+$(B)/test_native_image: tests/test_native_image.m host/image_service.m host/image_service.h host/image_ops.h | $(B)
+	$(CC) $(CFLAGS) -fobjc-arc tests/test_native_image.m host/image_service.m -framework Foundation -framework CoreGraphics -framework ImageIO -o $@
 $(B)/test_jit_script: tests/test_jit_script.m | $(B)
 	$(CC) -fobjc-arc -O2 -Wall -Wextra $< -framework Foundation -framework JavaScriptCore -o $@
 $(B)/test_scroll_pixels: tests/test_scroll_pixels.c tools/scroll_pixels.h tools/scroll_wheel.h | $(B)
@@ -129,7 +133,7 @@ IOS_CFLAGS = -std=c11 -Wall -Wextra -O2 -g -Icore -Ihost -Idevices -I$(IOS_DEPS)
 IB = build/ios
 IOS_SRC = $(wildcard core/*.c) host/prof_ios.c host/jit_region.c host/disk.c host/vm.c host/net_slirp.c host/share.c host/audio_mac.c host/hvsparse.c host/usb_host.c \
           $(filter-out devices/pvg_mac.m,$(wildcard devices/*.c))
-IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o
+IOS_OBJ = $(patsubst %.c,$(IB)/%.o,$(IOS_SRC)) $(IB)/host/enter.o $(IB)/devices/pvg_metal.o $(IB)/host/image_service.o
 
 $(IB)/core/mmu.o: core/mmu.c core/*.h host/*.h devices/*.h
 	@mkdir -p $(dir $@)
@@ -140,6 +144,9 @@ $(IB)/%.o: %.c core/*.h host/*.h devices/*.h
 $(IB)/devices/pvg_metal.o: devices/pvg_metal.m devices/*.h core/*.h host/*.h
 	@mkdir -p $(dir $@)
 	$(IOS_CC) $(IOS_CFLAGS) -fobjc-arc -Wno-unused-parameter -Wno-deprecated-declarations -c $< -o $@
+$(IB)/host/image_service.o: host/image_service.m host/image_service.h host/image_ops.h
+	@mkdir -p $(dir $@)
+	$(IOS_CC) $(IOS_CFLAGS) -fobjc-arc -c $< -o $@
 $(IB)/host/enter.o: host/enter.S
 	@mkdir -p $(dir $@)
 	$(IOS_CC) -c $< -o $@

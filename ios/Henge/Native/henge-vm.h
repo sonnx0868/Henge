@@ -46,6 +46,7 @@ int henge_vm_guest_el0(void);              /* any CPU running user code right no
 /* The shared folder and clipboard (host/share.c). henge_vm_share goes before henge_vm_boot; agent may be NULL.
    henge_share_take_clipboard returns what the guest copied, once: a malloc'd string, or NULL. */
 void henge_vm_share(const char *folder, const char *socket_path, const char *agent);
+void henge_vm_set_native_images(int enabled);
 void henge_share_set_clipboard(const char *text);
 char *henge_share_take_clipboard(void);
 long henge_share_agent_seen(void);
