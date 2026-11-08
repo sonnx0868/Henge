@@ -31,3 +31,26 @@ struct ScrollMotion {
         return (dx, dy)
     }
 }
+
+/// A disconnected pixel helper leaves only the guest's accelerated, discrete
+/// wheel. Preserve fractional wheel travel across isolated slow notches;
+/// waiting between them must not continually erase a low speed setting.
+struct ScrollFallback {
+    private var x: Float = 0, y: Float = 0
+    private var lastEmission = -Double.infinity
+
+    mutating func append(x dx: Float, y dy: Float, kind: ScrollInputKind, scale: Float, now: Double) -> (Int32, Int32) {
+        let safeScale = scale.isFinite ? min(max(scale, 0.1), 1.5) : 0.3
+        let divisor: Float = kind == .wheel ? 32 : 4
+        if dx.isFinite { x = min(max(x + dx / divisor * (safeScale / 0.3), -2), 2) }
+        if dy.isFinite { y = min(max(y + dy / divisor * (safeScale / 0.3), -2), 2) }
+        guard now.isFinite, now - lastEmission >= 0.05 else { return (0, 0) }
+        let sx: Int32 = abs(x) >= 1 ? (x < 0 ? -1 : 1) : 0
+        let sy: Int32 = abs(y) >= 1 ? (y < 0 ? -1 : 1) : 0
+        guard sx != 0 || sy != 0 else { return (0, 0) }
+        x -= Float(sx)
+        y -= Float(sy)
+        lastEmission = now
+        return (sx, sy)
+    }
+}

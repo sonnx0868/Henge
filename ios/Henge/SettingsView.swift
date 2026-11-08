@@ -7,6 +7,7 @@ struct SettingsView: View {
     @AppStorage(HardwareMouse.reverseKey) private var reverseScrolling = false
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
     @AppStorage("henge.performanceDiagnostics") private var performanceDiagnostics = false
+    @AppStorage(HardwareKeys.alternateCommandKey) private var alternateCommand = false
 
     var body: some View {
         NavigationStack {
@@ -21,6 +22,12 @@ struct SettingsView: View {
                     Button("Set up JIT") { jit.showSetup = true }
                     Toggle("Turn on JIT when Henge opens", isOn: $jitAtLaunch)
                     LabeledContent("Code region", value: "\(JITBootstrap.jitBytes >> 20) MB, claimed once per launch")
+                }
+                .listRowBackground(Desk.card)
+                Section("Hardware keyboard") {
+                    Toggle("Right Option sends Mac Command", isOn: $alternateCommand)
+                    Text("Use right Option + Space for the Mac's Spotlight, right Option + Tab to switch Mac apps, and right Option + H to hide a Mac app. Left Option keeps its usual function. iPadOS may reserve shortcuts using the physical Command key.")
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
                 .listRowBackground(Desk.card)
                 Section("Memory") {

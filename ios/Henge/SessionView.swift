@@ -24,11 +24,15 @@ struct SessionView: View {
     @AppStorage("henge.cursor.scale") private var cursorScale = Device.isPad ? 1 : 3
     @AppStorage("henge.cursor.sharp") private var sharpCursor = true
     @AppStorage(HardwareMouse.scrollSpeedKey) private var scrollSpeed = 0.3
+    @AppStorage(HardwareKeys.alternateCommandKey) private var alternateCommand = false
 
     @State private var typing = false
     @State private var zoomed = false
     @State private var showDetails = false
     @State private var confirmStop = false
+    @State private var toolbarVisible = true
+    @State private var toolbarRevision: UInt64 = 0
+    @State private var toolbarHovered = false
     @State private var zoomCentre = CGPoint(x: 0.5, y: 0.5) // where the zoomed view is, 0...1 of the Mac's screen
     @State private var map: UIImage?
     @State private var zoomFollowing: Task<Void, Never>?
@@ -84,6 +88,7 @@ struct SessionView: View {
         } message: {
             Text("This turns the Mac off at once. Anything not saved on it is lost.")
         }
+        .onChange(of: alternateCommand) { _ in HardwareKeys.releaseAll() }
         .onChange(of: zoomed) { on in
             zoomFollowing?.cancel()
             zoomFollowing = on ? Task { await followPointer() } : nil
@@ -95,12 +100,15 @@ struct SessionView: View {
             HardwareMouse.shared.releaseButtons()
         }
         .onChange(of: showDetails) { showing in
+            showToolbar()
             if showing { HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll() }
         }
         .onChange(of: confirmStop) { showing in
+            showToolbar()
             if showing { HardwareKeys.releaseAll(); StickyKeys.shared.releaseAll() }
         }
         .onAppear {
+            showToolbar()
             UIApplication.shared.isIdleTimerDisabled = true
             HardwareMouse.shared.start()
         }
@@ -113,6 +121,40 @@ struct SessionView: View {
         }
         .task { await run() }
         .task { await Sharing.followMacClipboard() }
+        .onChange(of: typing) { _ in showToolbar() }
+        .onChange(of: toolbarHovered) { _ in toolbarRevision &+= 1 }
+        .task(id: toolbarRevision) {
+            guard Device.isPad, toolbarVisible else { return }
+            do { try await Task.sleep(nanoseconds: 4_000_000_000) } catch { return }
+            guard !Task.isCancelled, !typing, !showDetails, !confirmStop, !toolbarHovered else { return }
+            hideToolbar()
+        }
+    }
+
+    private func showToolbar() {
+        withAnimation(.easeInOut(duration: 0.2)) { toolbarVisible = true }
+        toolbarRevision &+= 1
+    }
+
+    private func hideToolbar() {
+        toolbarHovered = false
+        withAnimation(.easeInOut(duration: 0.2)) { toolbarVisible = false }
+        toolbarRevision &+= 1
+    }
+
+    /// A small, explicit touch target keeps the controls reachable while the
+    /// guest owns the hardware pointer. No gesture over the Mac is intercepted.
+    private func toolbarHandle(_ layout: Layout) -> some View {
+        Button { showToolbar() } label: {
+            Image(systemName: "chevron.compact.down")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.8))
+                .frame(width: 64, height: 28)
+                .contentShape(Rectangle())
+                .deskGlass(in: Capsule())
+        }
+        .accessibilityLabel("Show Henge controls")
+        .position(x: layout.touch.midX, y: layout.insets.top + 16)
     }
 
     /// When there is something of the app's to point at, iPadOS gets its own pointer back.
@@ -186,25 +228,32 @@ struct SessionView: View {
     // MARK: Upright
 
     @ViewBuilder private func uprightControls(_ layout: Layout) -> some View {
-        if !typing {
+        if !typing && (!Device.isPad || toolbarVisible) {
             HStack {
                 tool("keyboard", "Keyboard") { typing = true }
                 Spacer()
                 pasteTool
                 Spacer()
-                tool("plus.magnifyingglass", "Zoom in") { zoomed = true }
-                Spacer()
+                if !Device.isPad {
+                    tool("plus.magnifyingglass", "Zoom in") { zoomed = true }
+                    Spacer()
+                }
                 tool("info.circle", "Details") { showDetails = true }
                 Spacer()
                 tool("power", "Shut down", tint: Desk.bad) { stopTapped() }
+                if Device.isPad {
+                    tool("chevron.up", "Hide controls") { hideToolbar() }
+                }
             }
             .padding(.horizontal, 22)
             .frame(width: layout.pad.width, height: 54)
             .background(Desk.card, in: Capsule())
             .overlay(Capsule().stroke(Desk.hairline, lineWidth: 0.5))
+            .onHover { toolbarHovered = $0 }
             .position(x: layout.pad.midX, y: layout.toolsY + 27)
             .transition(.opacity)
         }
+        if Device.isPad && !toolbarVisible { toolbarHandle(layout) }
         trackpadPanel(layout)
     }
 
@@ -248,6 +297,7 @@ struct SessionView: View {
     /// The system's paste button: iOS asks no permission for it, as it would if the app read the clipboard itself.
     private var pasteTool: some View {
         PasteButton(payloadType: String.self) { texts in
+            showToolbar()
             if let text = texts.first { Sharing.paste(text) }
         }
         .labelStyle(.iconOnly)
@@ -256,7 +306,10 @@ struct SessionView: View {
     }
 
     private func tool(_ symbol: String, _ label: String, tint: Color = Desk.text, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+        Button {
+            showToolbar()
+            action()
+        } label: {
             Image(systemName: symbol)
                 .font(.system(size: 19, weight: .medium))
                 .foregroundStyle(tint)
@@ -274,20 +327,30 @@ struct SessionView: View {
         let pill = HStack(spacing: 4) {
             tool("keyboard", "Keyboard", tint: .white) { typing.toggle() }
             pasteTool
-            tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
+            if !Device.isPad {
+                tool(zoomed ? "minus.magnifyingglass" : "plus.magnifyingglass", zoomed ? "Zoom out" : "Zoom in", tint: zoomed ? Desk.accentLight : .white) { zoomed.toggle() }
+            }
             tool("info.circle", "Details", tint: .white) { showDetails = true }
             Rectangle().fill(Color.white.opacity(0.3)).frame(width: 1, height: 22).padding(.horizontal, 4)
             tool("power", "Shut down", tint: Desk.bad) { stopTapped() }
+            if Device.isPad && !typing {
+                tool("chevron.up", "Hide controls", tint: .white) { hideToolbar() }
+            }
         }
         .padding(.horizontal, 8)
         .frame(height: 50)
         .deskGlass(in: Capsule())
-        if let barY = layout.barY {
-            pill.position(x: layout.touch.midX, y: barY)
-        } else if landscape || typing {
-            pill.position(x: layout.touch.midX, y: top + 25)
+        .onHover { toolbarHovered = $0 }
+        if !Device.isPad || toolbarVisible {
+            if let barY = layout.barY {
+                pill.position(x: layout.touch.midX, y: barY)
+            } else if landscape || typing {
+                pill.position(x: layout.touch.midX, y: top + 25)
+            } else {
+                pill.position(x: layout.touch.midX, y: layout.touch.height - layout.insets.bottom - 34)
+            }
         } else {
-            pill.position(x: layout.touch.midX, y: layout.touch.height - layout.insets.bottom - 34)
+            toolbarHandle(layout)
         }
         if zoomed { zoomMap(layout) }
     }
@@ -398,6 +461,11 @@ struct SessionView: View {
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                     Text("The Mac supplies a small pointer image. Enlarging it can look blurry; 1× is the sharpest on an iPad. Scroll speed changes apply immediately.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Section("Hardware keyboard") {
+                    Toggle("Right Option sends Mac Command", isOn: $alternateCommand)
+                    Text("Right Option + Space opens Mac Spotlight; right Option + Tab switches Mac apps. This avoids using the iPad's Command shortcuts.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("Sharing") {

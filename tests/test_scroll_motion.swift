@@ -50,6 +50,21 @@ struct ScrollMotionTests {
         wheel.append(x: 0, y: 1)
         precondition(motion.takeFrame() == (0, 1) && wheel.takeFrame() == (0, 32),
                      "separate device accumulators preserve the existing pad conversion")
+        for direction: Float in [1, -1] {
+            var fallback = ScrollFallback()
+            var emitted: Int32 = 0
+            for i in 0..<4 {
+                emitted += fallback.append(x: 0, y: 32 * direction, kind: .wheel, scale: 0.1, now: Double(i) * 0.2).1
+            }
+            precondition(emitted != 0 && (emitted > 0) == (direction > 0), "slow isolated wheel input must accumulate at low gain")
+        }
+        var fallback = ScrollFallback()
+        precondition(fallback.append(x: -32, y: 32, kind: .wheel, scale: 0.3, now: 0) == (-1, 1), "default coarse wheel conversion")
+        precondition(fallback.append(x: 0, y: 32, kind: .wheel, scale: 1.5, now: 0.01) == (0, 0), "fallback limits event frequency")
+        precondition(fallback.append(x: 0, y: 0, kind: .wheel, scale: 1.5, now: 0.06).1 == 1, "bounded pending fallback remains available")
+        fallback = ScrollFallback() // helper connection/disconnection, profile switch and reconnect
+        precondition(fallback.append(x: 0, y: 0, kind: .wheel, scale: 0.3, now: 1) == (0, 0), "reset clears stale travel")
+        precondition(fallback.append(x: 0, y: 4, kind: .precision, scale: 0.3, now: 2).1 == 1, "precision fallback retains its original conversion")
         print("scroll motion: recorded gesture, frame limits, idle, direction, spikes and subpixel checks passed")
         print("wheel motion: five isolated units, fractional horizontal input, invalid values and independent pad state passed")
     }

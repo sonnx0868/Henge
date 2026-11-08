@@ -43,13 +43,14 @@ enum Device {
 /// A keyboard attached to the device. iOS reports each key going down and coming up by its HID usage,
 /// which is what the Mac's USB keyboard sends, so every key and modifier goes straight across.
 enum HardwareKeys {
-    private static var held: Set<UInt8> = []
+    static let alternateCommandKey = "henge.keyboard.rightOptionIsCommand"
+    private static var routing = HardwareKeyRouting()
     private static var lastKey: CFTimeInterval = 0
 
     /// With the on-screen keyboard's view holding the keyboard, iOS may also offer a hardware key as
     /// text, and again as it repeats. The Mac has the key already, and repeats it itself.
     static var keyJustPressed: Bool {
-        held.contains { $0 < 0xe0 } || CACurrentMediaTime() - lastKey < 0.1
+        routing.physical.keys.contains { $0 < 0xe0 } || CACurrentMediaTime() - lastKey < 0.1
     }
 
     /// Sends the presses that are keys, and returns the rest.
@@ -71,12 +72,12 @@ enum HardwareKeys {
                 continue
             }
             let usage = UInt8(raw)
-            henge_vm_key_hid(usage, down ? 1 : 0)
+            let remap = UserDefaults.standard.bool(forKey: alternateCommandKey)
+            for (mapped, pressed) in routing.key(usage, down: down, rightOptionIsCommand: remap) {
+                henge_vm_key_hid(mapped, pressed ? 1 : 0)
+            }
             if usage < 0xe0 { lastKey = CACurrentMediaTime() }
-            if down {
-                held.insert(usage)
-            } else {
-                held.remove(usage)
+            if !down {
                 if usage < 0xe0 { StickyKeys.shared.releaseAll() } // one key after a tap on ⌃, ⌥ or ⌘
             }
         }
@@ -86,8 +87,7 @@ enum HardwareKeys {
     /// iPadOS can keep a key's release when it takes over, as it does for ⌘-Tab: the Mac must not
     /// go on thinking the key is down.
     static func releaseAll() {
-        for usage in held { henge_vm_key_hid(usage, 0) }
-        held.removeAll()
+        for usage in routing.releaseAll() { henge_vm_key_hid(usage, 0) }
     }
 }
 
@@ -126,6 +126,7 @@ final class HardwareMouse: ObservableObject {
         let id: ObjectIdentifier
         let name: String
         let profileKey: String
+        let attachment = UUID()
     }
     @Published private(set) var scrollDevices: [ScrollDevice] = []
 
@@ -133,8 +134,9 @@ final class HardwareMouse: ObservableObject {
         var kind: ScrollInputKind
         var motion: ScrollMotion
         var flush: DispatchWorkItem?
-        var lastTime: TimeInterval = 0, lastWheelTime: TimeInterval = 0
-        var fallbackX: Float = 0, fallbackY: Float = 0
+        var lastTime: TimeInterval = 0
+        var fallback = ScrollFallback()
+        var helperReady = false
         var rawLogs = 0, frameLogs = 0
         init(kind: ScrollInputKind) { self.kind = kind; motion = ScrollMotion(kind: kind) }
         deinit { flush?.cancel() }
@@ -165,13 +167,17 @@ final class HardwareMouse: ObservableObject {
         secondaryClick.reset()
         buttonLogs = [0, 0, 0]
         uiKitButtonLogs = 0
+        let epoch = inputEpoch
         GCMouse.mice().forEach(attach)
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidConnect, object: nil, queue: .main) { [weak self] note in
-            if let mouse = note.object as? GCMouse { self?.attach(mouse) }
+            guard let self, self.running, self.inputEpoch == epoch else { return }
+            if let mouse = note.object as? GCMouse { self.attach(mouse) }
         })
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidDisconnect, object: nil, queue: .main) { [weak self] note in
-            guard let self, let mouse = note.object as? GCMouse else { return }
+            guard let self, self.running, self.inputEpoch == epoch,
+                  let mouse = note.object as? GCMouse, self.mice.contains(where: { $0 === mouse }) else { return }
             self.releaseButtons()
+            self.clearHandlers(mouse)
             let id = ObjectIdentifier(mouse)
             self.scrollStates.removeValue(forKey: id)?.flush?.cancel()
             self.scrollDevices.removeAll { $0.id == id }
@@ -195,16 +201,20 @@ final class HardwareMouse: ObservableObject {
         observers.forEach(NotificationCenter.default.removeObserver)
         observers.removeAll()
         for mouse in mice {
-            guard let input = mouse.mouseInput else { continue }
-            input.mouseMovedHandler = nil
-            input.leftButton.pressedChangedHandler = nil
-            input.rightButton?.pressedChangedHandler = nil
-            input.middleButton?.pressedChangedHandler = nil
-            input.scroll.valueChangedHandler = nil
-            input.scroll.xAxis.valueChangedHandler = nil
-            input.scroll.yAxis.valueChangedHandler = nil
+            clearHandlers(mouse)
         }
         mice.removeAll()
+    }
+
+    private func clearHandlers(_ mouse: GCMouse) {
+        guard let input = mouse.mouseInput else { return }
+        input.mouseMovedHandler = nil
+        input.leftButton.pressedChangedHandler = nil
+        input.rightButton?.pressedChangedHandler = nil
+        input.middleButton?.pressedChangedHandler = nil
+        input.scroll.valueChangedHandler = nil
+        input.scroll.xAxis.valueChangedHandler = nil
+        input.scroll.yAxis.valueChangedHandler = nil
     }
 
     func releaseButtons() {
@@ -309,13 +319,14 @@ final class HardwareMouse: ObservableObject {
 
     /// Each physical device owns its pending frame, gain and fallback state.
     private func scrolled(horizontal: Float, vertical: Float, device: ScrollDevice, epoch: UInt64) {
-        guard running, epoch == inputEpoch, let state = scrollStates[device.id] else { return }
+        guard running, epoch == inputEpoch,
+              scrollDevices.contains(where: { $0.id == device.id && $0.attachment == device.attachment }),
+              let state = scrollStates[device.id] else { return }
         guard horizontal != 0 || vertical != 0 else { return }
         let now = ProcessInfo.processInfo.systemUptime
         if now - state.lastTime > 0.12 {
             state.motion = ScrollMotion(kind: state.kind)
-            state.fallbackX = 0
-            state.fallbackY = 0
+            if state.kind == .precision { state.fallback = ScrollFallback() }
             state.rawLogs = 0
             state.frameLogs = 0
         }
@@ -345,9 +356,12 @@ final class HardwareMouse: ObservableObject {
         let (x, y) = state.motion.takeFrame()
         let horizontal = way * x, vertical = way * y
         guard horizontal != 0 || vertical != 0 else { return }
-        if henge_vm_mouse_scroll_motion(Double(horizontal), Double(vertical), Double(scale)) != 0 {
-            state.fallbackX = 0
-            state.fallbackY = 0
+        let helperReady = henge_vm_mouse_scroll_motion(Double(horizontal), Double(vertical), Double(scale)) != 0
+        if helperReady != state.helperReady {
+            state.fallback = ScrollFallback()
+            state.helperReady = helperReady
+        }
+        if helperReady {
             if scrollDiagnostics && state.frameLogs < 24 {
                 state.frameLogs += 1
                 HengeLog.log("input", "scroll frame raw: \(horizontal), \(vertical); scale \(scale); device \(device.name); kind \(state.kind.rawValue); protocol v2")
@@ -356,18 +370,9 @@ final class HardwareMouse: ObservableObject {
         }
         // Until the helper is ready, never feed a high-rate pad into the guest's
         // accelerated coarse wheel: at most one notch per axis every 50 ms.
-        // Convert wheel pixels back to raw wheel units for the discrete fallback.
-        let unit: Float = state.kind == .wheel ? 8 : 1
-        state.fallbackX = min(max(state.fallbackX + horizontal / unit * (scale / 0.3), -8), 8)
-        state.fallbackY = min(max(state.fallbackY + vertical / unit * (scale / 0.3), -8), 8)
         let now = ProcessInfo.processInfo.systemUptime
-        guard now - state.lastWheelTime >= 0.05 else { return }
-        let dx: Int32 = abs(state.fallbackX) >= 4 ? (state.fallbackX < 0 ? -1 : 1) : 0
-        let dy: Int32 = abs(state.fallbackY) >= 4 ? (state.fallbackY < 0 ? -1 : 1) : 0
+        let (dx, dy) = state.fallback.append(x: horizontal, y: vertical, kind: state.kind, scale: scale, now: now)
         guard dx != 0 || dy != 0 else { return }
-        state.fallbackX -= Float(dx) * 4
-        state.fallbackY -= Float(dy) * 4
-        state.lastWheelTime = now
         henge_vm_mouse_scroll(dx, dy)
         if scrollDiagnostics && state.frameLogs < 24 {
             state.frameLogs += 1
