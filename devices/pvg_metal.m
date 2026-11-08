@@ -940,7 +940,51 @@ typedef struct {
 #define U16(off) (*(const uint16_t *)(r.p + (off)))
 #define U64(off) ({ uint64_t _v; memcpy(&_v, r.p + (off), 8); _v; })
 
-- (id<MTLRenderCommandEncoder>)beginPass:(Rec)r task:(uint32_t)task commandBuffer:(id<MTLCommandBuffer>)cb {
+/* Scanout and render targets are distinct texture views of the same buffer.
+   Resource-list flags alone do not identify writes in every guest submission. */
+- (BOOL)textureSharesScanout:(id<MTLTexture>)texture {
+    if (!texture) return NO;
+    os_unfair_lock_lock(&screen_lock);
+    id<MTLTexture> visible = screen_tex;
+    os_unfair_lock_unlock(&screen_lock);
+    if (!visible) return NO;
+    if (texture == visible) return YES;
+    while (texture.parentTexture) texture = texture.parentTexture;
+    while (visible.parentTexture) visible = visible.parentTexture;
+    if (texture == visible) return YES;
+    /* Buffer identity, not pixel format: BGRA/sRGB/half-float views can differ.
+       Separate allocations within one large buffer must not keep scanout awake.
+       Buffer-backed 2D textures have one linear row range; unfamiliar layouts
+       conservatively use the remainder of their backing buffer. */
+    id<MTLBuffer> buffer = texture.buffer;
+    if (!buffer || buffer != visible.buffer) return NO;
+    NSUInteger a = texture.bufferOffset, b = visible.bufferOffset, length = buffer.length;
+    if (a >= length || b >= length) return NO;
+    NSUInteger aBytes = length - a, bBytes = length - b;
+    if (texture.textureType == MTLTextureType2D && texture.height && texture.bufferBytesPerRow &&
+        texture.bufferBytesPerRow <= aBytes / texture.height)
+        aBytes = texture.bufferBytesPerRow * texture.height;
+    if (visible.textureType == MTLTextureType2D && visible.height && visible.bufferBytesPerRow &&
+        visible.bufferBytesPerRow <= bBytes / visible.height)
+        bBytes = visible.bufferBytesPerRow * visible.height;
+    return a < b + bBytes && b < a + aBytes;
+}
+
+- (BOOL)attachmentSharesScanout:(id<MTLTexture>)texture ref:(uint32_t)ref task:(uint32_t)task {
+    if (!texture) return NO;
+    if ([self textureSharesScanout:texture]) return YES;
+    /* Canonical guest surface ownership also handles separate host wrappers. */
+    os_unfair_lock_lock(&screen_lock);
+    id<MTLTexture> visible = screen_tex;
+    os_unfair_lock_unlock(&screen_lock);
+    if (!visible) return NO;
+    for (HvObject *o = [self object:ref task:task]; o; o = o->parent) {
+        if (o->scanout == visible || (o->surface && o->surface->scanout == visible)) return YES;
+    }
+    return NO;
+}
+
+- (id<MTLRenderCommandEncoder>)beginPass:(Rec)r task:(uint32_t)task commandBuffer:(id<MTLCommandBuffer>)cb redraw:(BOOL *)redraw {
     MTLRenderPassDescriptor *d = [MTLRenderPassDescriptor renderPassDescriptor];
 #define ATTACH(a, o)                                                 \
     do {                                                             \
@@ -998,6 +1042,18 @@ typedef struct {
         fprintf(stderr, "trace: pass c0 ref %u %lux%lu fmt %lu load %lu store %lu clear %.2f %.2f %.2f %.2f surface %s heap %d\n", U32(0x4c), (unsigned long)c0.width, (unsigned long)c0.height, (unsigned long)c0.pixelFormat, (unsigned long)d.colorAttachments[0].loadAction, (unsigned long)d.colorAttachments[0].storeAction, cc.red, cc.green, cc.blue, cc.alpha, co && co->surface ? "yes" : "no", c0.heap != nil);
     }
     id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:d];
+    if (e) {
+        for (int i = 0; i < 8; i++) {
+            MTLRenderPassColorAttachmentDescriptor *c = d.colorAttachments[i];
+            uint32_t offset = 0x4c + (uint32_t)i * 0x3c;
+            if (offset + 0x3c > r.size) break;
+            BOOL resolves = c.storeAction == MTLStoreActionMultisampleResolve ||
+                            c.storeAction == MTLStoreActionStoreAndMultisampleResolve;
+            if ([self attachmentSharesScanout:c.texture ref:U32(offset) task:task] ||
+                (resolves && [self attachmentSharesScanout:c.resolveTexture ref:U32(offset + 4) task:task]))
+                *redraw = YES;
+        }
+    }
     if (!e) {
         NSMutableString *m = [NSMutableString stringWithString:@"no render encoder:"];
         for (int i = 0; i < 8; i++) {
@@ -1778,7 +1834,7 @@ typedef struct {
                     else if (tag == 33 || tag == 32) [self complain:[NSString stringWithFormat:@"pass description %u (%u bytes) not done", tag, size]];
                 } else if (etype == 0 && tag == 26) {
                     if (e) [e endEncoding];
-                    e = [self beginPass:r task:task commandBuffer:cb];
+                    e = [self beginPass:r task:task commandBuffer:cb redraw:&writes_visible];
                     pipeline_set = NO, tess_factors = NO;
                 } else if (e) {
                     if (etype == 0) [self render:e tag:tag rec:r task:task];

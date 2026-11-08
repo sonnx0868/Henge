@@ -3,8 +3,13 @@
 #include "../devices/pvg_metal.m"
 #include <assert.h>
 
-/* No guest memory is needed for an empty exec. Any unexpected access fails. */
-int hv_pvg_lite_task_read(HvPvgLite *p, uint32_t t, uint64_t a, void *o, uint32_t n) { abort(); }
+/* Only the serialized render pass below is guest-readable. */
+static uint8_t guest_commands[8 + 8 + 0x248];
+int hv_pvg_lite_task_read(HvPvgLite *p, uint32_t t, uint64_t a, void *o, uint32_t n) {
+    assert(a == 0x1000 && n == sizeof guest_commands);
+    memcpy(o, guest_commands, n);
+    return 0;
+}
 void hv_pvg_lite_task_pages(HvPvgLite *p, uint32_t t, uint64_t a, uint64_t n, uint32_t *o) { abort(); }
 uint8_t *hv_pvg_lite_page(HvPvgLite *p, uint32_t n) { abort(); }
 void *hv_pvg_lite_phys(HvPvgLite *p, uint64_t a, uint64_t n) { abort(); }
@@ -15,6 +20,27 @@ void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *c, uint32_t n) { abort();
 static unsigned stamps;
 void hv_pvg_lite_complete(HvPvgLite *p, uint32_t c, uint32_t s) { stamps++; }
 
+@interface TestTexture : NSObject
+@property(nonatomic, strong) id<MTLBuffer> buffer;
+@property(nonatomic, strong) id<MTLTexture> parentTexture;
+@property NSUInteger bufferOffset, bufferBytesPerRow, height;
+@property MTLTextureType textureType;
+@end
+@implementation TestTexture
+@end
+
+@interface TestBuffer : NSObject
+@property NSUInteger length;
+@end
+@implementation TestBuffer
+@end
+
+@interface TestEncoder : NSObject
+@end
+@implementation TestEncoder
+- (void)endEncoding {}
+@end
+
 @interface TestCB : NSObject
 @property(nonatomic, strong) NSMutableArray *handlers;
 @property(nonatomic, strong) NSError *error;
@@ -24,6 +50,7 @@ void hv_pvg_lite_complete(HvPvgLite *p, uint32_t c, uint32_t s) { stamps++; }
 - (instancetype)init { if ((self = [super init])) _handlers = [NSMutableArray new]; return self; }
 - (void)addCompletedHandler:(MTLCommandBufferHandler)handler { [_handlers addObject:[handler copy]]; }
 - (void)commit { _status = MTLCommandBufferStatusCommitted; }
+- (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)descriptor { return [TestEncoder new]; }
 - (void)waitUntilCompleted { abort(); } /* refresh must never block the worker */
 - (void)finish:(BOOL)success {
     _status = success ? MTLCommandBufferStatusCompleted : MTLCommandBufferStatusError;
@@ -69,7 +96,14 @@ int main(void) {
         r->presenter = dispatch_queue_create("test.present", DISPATCH_QUEUE_SERIAL);
         r->screen_lock = OS_UNFAIR_LOCK_INIT;
         /* A retained scanout exists; the test presenter does not sample it. */
-        r->screen_tex = (id<MTLTexture>)[NSObject new];
+        TestTexture *scanout = [TestTexture new];
+        TestBuffer *backing = [TestBuffer new];
+        backing.length = 8192;
+        scanout.buffer = (id<MTLBuffer>)backing;
+        scanout.bufferBytesPerRow = 256;
+        scanout.height = 16;
+        scanout.textureType = MTLTextureType2D;
+        r->screen_tex = (id<MTLTexture>)scanout;
         r->resource = [HvObject new];
         r->resource->surface = [HvObject new];
         r->resource->surface->scanout = r->screen_tex;
@@ -110,7 +144,41 @@ int main(void) {
             assert(r->displayed == 3);
         }
         assert(!r->screen_dirty && !r->presenter_running);
-        puts("PVG present: visible writes wake idle scanout; offscreen/read-only work, failed jobs and stamp fences do not redraw");
+        /* A real render attachment writes scanout despite missing resource write
+           flags and a distinct view with no HvObject.surface association. */
+        TestTexture *target = [TestTexture new], *view = [TestTexture new];
+        target.buffer = scanout.buffer;
+        target.bufferBytesPerRow = scanout.bufferBytesPerRow;
+        target.height = scanout.height;
+        target.textureType = MTLTextureType2D;
+        view.parentTexture = (id<MTLTexture>)target;
+        r->resource->object = view;
+        assert([r textureSharesScanout:(id<MTLTexture>)view]);
+        uint32_t segment = sizeof guest_commands - 8, info = 0, tag = 26, record = 8 + 0x248;
+        memcpy(guest_commands, &segment, 4);
+        memcpy(guest_commands + 4, &info, 4);
+        memcpy(guest_commands + 8, &tag, 4);
+        memcpy(guest_commands + 12, &record, 4);
+        uint32_t ref = 1;
+        uint16_t store = MTLStoreActionStore;
+        memcpy(guest_commands + 16 + 0x4c, &ref, 4);
+        memcpy(guest_commands + 16 + 0x4c + 22, &store, 2);
+        struct __attribute__((packed)) {
+            uint32_t task, nres, nbuf, ref, flags;
+            uint64_t offset, length;
+        } attachment_exec = {0, 1, 1, 1, 1, 0x1000, sizeof guest_commands};
+        for (unsigned scenario = 0; scenario < 3; scenario++) {
+            if (scenario == 2) target.bufferOffset = 4096; /* offscreen in SAME backing allocation */
+            q.next = [TestCB new];
+            assert([r exec:(const uint32_t *)&attachment_exec length:sizeof attachment_exec channel:1 stamp:10 + scenario]);
+            dispatch_sync(r->presenter, ^{});
+            assert(r->displayed == 3 + (scenario > 0));
+            [q.next finish:scenario != 1]; /* failed visible write must not wake */
+            dispatch_sync(r->presenter, ^{});
+            assert(r->displayed == 4);
+        }
+        assert(!r->screen_dirty && !r->presenter_running);
+        puts("PVG present: actual scanout attachments wake after successful completion without resource write flags or input; offscreen/read-only work and failed jobs stay idle");
     }
     return 0;
 }
