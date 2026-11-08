@@ -60,6 +60,12 @@ int main(void) {
         hv_scroll_wheel_append(&burst, 0.25, 0, 4 + i * 0.01);
         CHECK(hv_scroll_wheel_take(&burst, 4 + i * 0.01).x == (i == 3 ? 1 : 0), "wheel fractions accumulate");
     }
+    int isolated_fraction = 0;
+    for (int i = 0; i < 3; i++) {
+        hv_scroll_wheel_append(&burst, 0, 0.4, 5 + i);
+        isolated_fraction += hv_scroll_wheel_take(&burst, 5 + i).y;
+    }
+    CHECK(isolated_fraction == 1, "fractional wheel motion survives one-second gaps between slow notches");
     HvScrollLine parsed;
     CHECK(hv_scroll_parse_line("41.000000 -9.000000 0.100000", &parsed) && parsed.kind == 'P' && parsed.x == 41,
           "new helper accepts original v2 numeric messages");

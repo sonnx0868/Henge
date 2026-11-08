@@ -22,6 +22,12 @@ enum Device {
         return (1600, Int((Double(fit.height) * 5 / 6 / 8).rounded()) * 8)
     }
 
+    /// A smaller render target for sustained web/video sessions on iPad.
+    static var lowLoadScreen: (width: Int, height: Int) {
+        let fit = fittingScreen
+        return (1440, Int((Double(fit.height) * 3 / 4 / 8).rounded()) * 8)
+    }
+
     /// How much memory to suggest for a new Mac: what leaves this device room for iOS.
     static var suggestedRAMGB: Int {
         let mb = ProcessInfo.processInfo.physicalMemory >> 20

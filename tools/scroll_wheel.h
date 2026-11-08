@@ -18,7 +18,14 @@ static inline int hv_scroll_wheel_pending(const HvScrollWheel *w) {
 
 static inline void hv_scroll_wheel_append(HvScrollWheel *w, double x, double y, double now) {
     if (!isfinite(x) || !isfinite(y) || !isfinite(now)) return;
-    if (now < w->last_input || now - w->last_input > 0.5) w->x = w->y = 0;
+    if (now < w->last_input) w->x = w->y = 0;
+    else if (now - w->last_input > 0.5) {
+        // Expire late whole-pixel motion, but keep subpixel remainder across
+        // isolated slow notches. Resetting that fraction makes low input
+        // values move only when the user spins fast enough to coalesce them.
+        w->x -= trunc(w->x);
+        w->y -= trunc(w->y);
+    }
     w->x = fmin(fmax(w->x + x, -1280), 1280);
     w->y = fmin(fmax(w->y + y, -1280), 1280);
     w->last_input = now;
@@ -34,8 +41,13 @@ static inline int hv_scroll_wheel_step(double *pending) {
 }
 
 static inline HvScrollWheelFrame hv_scroll_wheel_take(HvScrollWheel *w, double now) {
-    if (!isfinite(now) || now < w->last_input || now - w->last_input > 0.5) {
+    if (!isfinite(now) || now < w->last_input) {
         w->x = w->y = 0;
+        return (HvScrollWheelFrame){0};
+    }
+    if (now - w->last_input > 0.5) {
+        w->x -= trunc(w->x);
+        w->y -= trunc(w->y);
         return (HvScrollWheelFrame){0};
     }
     return (HvScrollWheelFrame){hv_scroll_wheel_step(&w->x), hv_scroll_wheel_step(&w->y)};

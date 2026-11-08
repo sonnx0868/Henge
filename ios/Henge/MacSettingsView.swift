@@ -61,12 +61,15 @@ struct MacSettingsView: View {
                     DeskHeading("Screen")
                     VStack(alignment: .leading, spacing: 12) {
                         Picker("Screen", selection: Binding(get: {
+                            if mac.screen.width == Device.lowLoadScreen.width,
+                               mac.screen.height == Device.lowLoadScreen.height { return "lowLoad" }
                             if mac.screen.width == Device.performanceScreen.width,
                                mac.screen.height == Device.performanceScreen.height { return "performance" }
                             if mac.screen.width == 1920, mac.screen.height == 1080 { return "wide" }
                             return "fit"
                         }, set: { choice in
                             switch choice {
+                            case "lowLoad": (mac.screenWidth, mac.screenHeight) = Device.lowLoadScreen
                             case "performance": (mac.screenWidth, mac.screenHeight) = Device.performanceScreen
                             case "wide": (mac.screenWidth, mac.screenHeight) = (1920, 1080)
                             default: (mac.screenWidth, mac.screenHeight) = Device.fittingScreen
@@ -74,11 +77,12 @@ struct MacSettingsView: View {
                             save()
                         })) {
                             Text("Performance").tag("performance")
+                            Text("Low load").tag("lowLoad")
                             Text("Fit this iPad").tag("fit")
                             Text("16:9").tag("wide")
                         }
                         .pickerStyle(.segmented)
-                        Text("\(mac.screen.width) × \(mac.screen.height). Performance renders about 30% fewer pixels. Changes apply the next time this Mac starts.")
+                        Text("\(mac.screen.width) × \(mac.screen.height). Low load renders about 19% fewer pixels than Performance. Changes apply the next time this Mac starts.")
                             .font(.system(size: 13)).foregroundStyle(Desk.dim)
                     }
                     .padding(17)
