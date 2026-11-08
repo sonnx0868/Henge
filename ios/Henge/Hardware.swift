@@ -194,6 +194,7 @@ final class HardwareMouse: ObservableObject {
     private var reverse = false
     private var scrollDiagnostics = false
     private(set) var recentScrollSamples: [[String: Any]] = []
+    private(set) var recentButtonSamples: [[String: Any]] = []
     private var running = false
     private var secondaryClick = SecondaryClickRouting()
     private var buttonLogs = [0, 0, 0]
@@ -208,6 +209,7 @@ final class HardwareMouse: ObservableObject {
         reverse = defaults.bool(forKey: Self.reverseKey)
         scrollDiagnostics = defaults.bool(forKey: "henge.performanceDiagnostics")
         recentScrollSamples.removeAll(keepingCapacity: true)
+        recentButtonSamples.removeAll(keepingCapacity: true)
         secondaryClick.reset()
         buttonLogs = [0, 0, 0]
         uiKitButtonLogs = 0
@@ -311,6 +313,7 @@ final class HardwareMouse: ObservableObject {
 
     private func button(_ button: Int32, _ pressed: Bool, device: String) {
         guard running, button >= 0, button < 3 else { return }
+        recordButton(button, pressed, source: "controller", stage: "received")
         if scrollDiagnostics && buttonLogs[Int(button)] < 32 {
             buttonLogs[Int(button)] += 1
             HengeLog.log("input", "mouse button raw: controller \(device) button \(button) \(pressed ? "down" : "up")")
@@ -326,6 +329,7 @@ final class HardwareMouse: ObservableObject {
 
     func secondaryClickFromUIKit() {
         guard running else { return }
+        recordButton(1, true, source: "UIKit", stage: "received")
         let events = secondaryClick.uiKitClick(now: ProcessInfo.processInfo.systemUptime)
         if scrollDiagnostics && uiKitButtonLogs < 32 {
             uiKitButtonLogs += 1
@@ -335,6 +339,7 @@ final class HardwareMouse: ObservableObject {
     }
 
     private func sendButton(_ button: Int32, _ pressed: Bool, source: String) {
+        recordButton(button, pressed, source: source, stage: "guest")
         henge_vm_mouse_button(button, pressed ? 1 : 0)
         if scrollDiagnostics && button == 1 {
             HengeLog.log("input", "mouse button guest: \(source) secondary \(pressed ? "down" : "up")")
@@ -345,6 +350,13 @@ final class HardwareMouse: ObservableObject {
             buttonsDown.remove(button)
             StickyKeys.shared.releaseAll()
         }
+    }
+
+    private func recordButton(_ button: Int32, _ pressed: Bool, source: String, stage: String) {
+        guard scrollDiagnostics else { return }
+        recentButtonSamples.append(["uptime": ProcessInfo.processInfo.systemUptime, "button": button,
+                                    "pressed": pressed, "source": source, "stage": stage])
+        if recentButtonSamples.count > 64 { recentButtonSamples.removeFirst(recentButtonSamples.count - 64) }
     }
 
     func scrollKind(for device: ScrollDevice) -> ScrollInputKind {

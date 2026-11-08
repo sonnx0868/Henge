@@ -672,6 +672,8 @@ struct SessionView: View {
                     "guestCPUs": cpus, "guestRAMMiB": ram,
                     "jitMiB": JITBootstrap.jitBytes >> 20,
                     "thermalState": Self.thermalLabel(heat),
+                    "pixelScrollReady": henge_vm_pixel_scroll_ready() != 0,
+                    "secondaryButtonSamples": HardwareMouse.shared.recentButtonSamples,
                     "wheelPixelScrollReady": henge_vm_pixel_wheel_ready() != 0,
                     "mouseWheelGain": UserDefaults.standard.object(forKey: HardwareMouse.wheelSpeedKey) as? Double ?? 0.3,
                     "gpuSubmittedFramesInterval": gpuFrames &- lastGPUFrames,
