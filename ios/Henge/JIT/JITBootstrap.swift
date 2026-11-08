@@ -60,8 +60,8 @@ enum JITBootstrap {
     /// The one region HengeVM's translator gets for the whole session (it flushes and starts over when full,
     /// never asks for more). 1 GB takes about 1.5 s to prepare, and a first boot through Setup makes that much code; a full flush drops all of it.
     static let codeCacheKey = "henge.perf.codeCacheMB"
-    /// 1 GB, or 1.5 GB (Settings > Performance > Code cache; without a choice there, 1.5 GB where the memory limit
-    /// has room for it: about 6 GB on 12 GB iPhones). A bigger cache fills and empties less often (macOS 27 filled
+    /// 1 GB by default, or an explicit 1.5 GB (Settings > Performance > Code cache).
+    /// A bigger cache fills and empties less often (macOS 27 filled
     /// 1 GB about once a minute) and costs more memory (its blocks' records come to about 0.75 of its size). Fixed for
     /// the launch: the region is claimed once.
     static let defaultCodeCacheMB = 1024 // retain the tested default; 1536 MB remains an explicit experimental choice

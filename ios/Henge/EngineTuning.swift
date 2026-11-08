@@ -22,7 +22,8 @@ enum EngineTuning {
         var env = defaults
         let d = UserDefaults.standard
         if d.bool(forKey: "henge.performanceDiagnostics") { env["HV_STATS"] = "15" }
-        if d.integer(forKey: refreshKey) == 120 { env["HV_HZ"] = "120" }
+        let hz = d.integer(forKey: refreshKey)
+        if [30, 60, 120].contains(hz) { env["HV_HZ"] = String(hz) }
         if d.bool(forKey: superblocksKey) { env["HV_SUPERBLOCKS"] = "1" } else { unsetenv("HV_SUPERBLOCKS") }
         if d.bool(forKey: wfiSpinKey) { env["HV_WFI_SPIN"] = "50" }
         if d.object(forKey: fastFlushKey) as? Bool == false { env["HV_FLUSH"] = "0" }

@@ -26,6 +26,16 @@ static int diagnostics;
 
 void henge_vm_set_diagnostics(int enabled) { diagnostics = enabled != 0; }
 
+const char *henge_vm_ram_backing(void) {
+    if (state != 1) return "not-running";
+    switch (hv_vm_board()->ram_backing) {
+    case HV_RAM_LEDGER: return "mach-ledger-outside-footprint";
+    case HV_RAM_FILE: return "mapped-file";
+    case HV_RAM_ANONYMOUS: return "anonymous";
+    default: return "unallocated";
+    }
+}
+
 static void on_exit(int reason) {
     exit_reason = reason;
     state = 2;

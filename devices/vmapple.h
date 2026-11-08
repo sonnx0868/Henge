@@ -70,6 +70,7 @@ typedef struct HvVmapple {
     HvVirtioUsb *vusb;       /* the USB device port an installer talks to (installer boots only) */
     uint8_t *cfg, *rom, *ram;
     uint64_t ram_size;
+    enum { HV_RAM_UNALLOCATED, HV_RAM_LEDGER, HV_RAM_FILE, HV_RAM_ANONYMOUS } ram_backing;
     uint64_t panic_events;   /* last pvpanic event the guest reported */
     void (*poll)(void);      /* extra device work on the CPU thread each tick (Mac PVG) */
 } HvVmapple;

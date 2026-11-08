@@ -38,6 +38,8 @@ uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and
 uint64_t henge_vm_audio_underruns(void);
 uint64_t henge_vm_audio_queued_bytes(void);
 int henge_vm_cpus_on(void);                /* CPUs the guest has started */
+/* Which allocation actually succeeded, rather than the requested setting. Static string. */
+const char *henge_vm_ram_backing(void);
 int henge_vm_guest_el0(void);              /* any CPU running user code right now */
 
 /* Input: Linux key codes, relative pointer, buttons 0 left 1 right 2 middle. */

@@ -257,7 +257,10 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
     b->ram = MAP_FAILED;
     if (!getenv("HV_RAM_NO_LEDGER")) {
         uint8_t *free_of_footprint = alloc_no_footprint(ram_size);
-        if (free_of_footprint) b->ram = free_of_footprint;
+        if (free_of_footprint) {
+            b->ram = free_of_footprint;
+            b->ram_backing = HV_RAM_LEDGER;
+        }
     }
     if (b->ram == MAP_FAILED && ram_file && *ram_file) {
         int fd = open(ram_file, O_RDWR | O_CREAT | O_TRUNC, 0600);
@@ -269,6 +272,7 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
         }
         if (b->ram == MAP_FAILED) fprintf(stderr, "hengevm: guest RAM file %s failed: %s; using anonymous memory\n", ram_file, strerror(errno));
         else {
+            b->ram_backing = HV_RAM_FILE;
             fprintf(stderr, "hengevm: guest RAM (%llu MB) is backed by a file\n", (unsigned long long)(ram_size >> 20));
             if (!getenv("HV_RAM_NO_PREFAULT")) {
                 struct PrefaultArgs *a = malloc(sizeof *a);
@@ -279,7 +283,10 @@ int hv_vmapple_create(HvVmapple *b, HvMachine *m, HvCpu *cpu, uint64_t ram_size,
             }
         }
     }
-    if (b->ram == MAP_FAILED) b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (b->ram == MAP_FAILED) {
+        b->ram = mmap(NULL, ram_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if (b->ram != MAP_FAILED) b->ram_backing = HV_RAM_ANONYMOUS;
+    }
     if (b->ram == MAP_FAILED) return -1;
     b->rom = mmap(NULL, ROM_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (b->rom == MAP_FAILED) return -1;
