@@ -95,6 +95,7 @@ int main(void) {
         r->queue = (id<MTLCommandQueue>)q;
         r->presenter = dispatch_queue_create("test.present", DISPATCH_QUEUE_SERIAL);
         r->screen_lock = OS_UNFAIR_LOCK_INIT;
+        r->layer = [CAMetalLayer layer]; // the production presenter now requires an attached layer
         /* A retained scanout exists; the test presenter does not sample it. */
         TestTexture *scanout = [TestTexture new];
         TestBuffer *backing = [TestBuffer new];

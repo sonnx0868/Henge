@@ -125,6 +125,10 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     NSMutableDictionary<NSNumber *, NSMutableDictionary<NSNumber *, HvObject *> *> *tasks;
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *mapped_textures;
     NSMutableDictionary<NSNumber *, HvObject *> *surfaces;
+    /* Multi-plane surfaces' host IOSurfaces by the guest memory they stand for: each process maps a surface
+       under its own mapping id, and what one draws (macOS 27's WebKit draws pages into b3a8 tiles in its GPU
+       process) has to be what another reads (WindowServer). */
+    NSMutableDictionary<NSString *, id> *planar;
     NSMutableSet<NSString *> *complaints;
     NSMutableSet<NSString *> *video_view_layouts;
     uint64_t execs, draws, failed, heap_bytes, synced, remaps;
@@ -155,18 +159,25 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     BOOL late, late_queued;
     uint64_t frames, frames_shot;
     /* Showing frames with the GPU: a layer the app gave us. No copies, no conversion on a CPU. */
-    CAMetalLayer *layer;
+    CAMetalLayer *layer; /* screen_lock protects the target and its generation */
+    uint64_t layer_generation;
+    __weak CAMetalLayer *prepared_layer; /* presenter only: each target needs its own setup */
     id<MTLRenderPipelineState> screen_pipe, linear_pipe, cursor_pipe;
+    id<MTLFunction> stand_in; /* computeStandIn */
     id<MTLTexture> cursor_tex;
     id<MTLSamplerState> screen_sampler, cursor_sampler;
     uint64_t on_screen; /* the mapping showing */
-    uint64_t gpu_frames;
+    _Atomic uint64_t gpu_frames;
     uint64_t screen_swaps;
     _Atomic uint64_t gpu_redraws;
     dispatch_queue_t presenter;
     os_unfair_lock screen_lock; /* what to show, and the pointer as the presenter reads it */
     id<MTLTexture> screen_tex;
     BOOL screen_half, screen_dirty, presenter_running;
+    BOOL drawable_retry_pending;
+    double drawable_retry_cooldown; /* fresh work coalesces one wake at its expiry */
+    uint64_t screen_requests; /* fresh frames/cursor changes, not automatic retries */
+    double drawable_retry_deadline; /* at most two seconds of retrying an unavailable target */
     uint32_t screen_w, screen_h;
     id<MTLBuffer> test_readback; /* HV_PVG_GPU_TEST: the drawable's pixels for screenshots */
     id<MTLBuffer> readback;
@@ -177,6 +188,9 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
 - (void)complain:(NSString *)what;
 - (HvObject *)object:(uint32_t)ref task:(uint32_t)task;
 - (void)drawCursor;
+- (BOOL)hasDisplayLayer;
+- (void)kickPresenter:(BOOL)fresh;
+- (void)present:(uint64_t)mapping;
 - (void)screenChanged;
 @end
 
@@ -186,6 +200,7 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     __unsafe_unretained HvReplay *replay;
     uint32_t task;
     NSString *failure;
+    id standIn; /* what a failed function lookup returns: nil, except for compute pipelines (makeSerialized) */
 }
 @end
 
@@ -196,6 +211,28 @@ static double now_seconds(void) {
 static int read_mapped_descriptor(void *context, uint32_t task, uint64_t address, void *out, uint32_t bytes) {
     return hv_pvg_lite_task_read((HvPvgLite *)context, task, address, out, bytes);
 }
+
+/* How the half-float display surface is shown. WindowServer writes DISPLAY-ENCODED values there (extended sRGB: the guest's gray 128 is
+   0.502, measured with the colour probe), so mode 0 passes them through. Mode 1 treats them as LINEAR light and applies the sRGB encode,
+   which is what this code did before (and was only right for a linear display profile such as ACES CG Linear: with every other profile
+   it encodes twice and the screen looks pale). HV_PVG_HALF=linear selects mode 1 at start; with the colour probe on, a file named
+   mode-linear or mode-encoded in its folder switches it while running. */
+static _Atomic int hv_half_mode = -1;
+static int hv_half_mode_get(void) {
+    int m = atomic_load(&hv_half_mode);
+    if (m < 0) {
+        const char *e = getenv("HV_PVG_HALF");
+        m = e && !strcmp(e, "linear") ? 1 : 0;
+        atomic_store(&hv_half_mode, m);
+    }
+    return m;
+}
+static float hv_half_shown(float v, int mode) { /* what the screen shows for a half-float component */
+    v = v < 0 ? 0 : v > 1 ? 1 : v;
+    return mode == 1 ? (v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f) : v;
+}
+
+#include "pvg_colorprobe.h" /* HV_COLOR_PROBE: what the display is told and shown, for chasing colour problems */
 
 /* A contiguous view of a task's guest pages; holes are left as zero pages. */
 /* A range of task memory at one address, page by page. Metal pins a buffer's
@@ -278,6 +315,25 @@ static void descriptor_common(MTLTextureDescriptor *t, uint8_t flags, uint16_t o
     t.resourceOptions = o;
 }
 
+/* Metal aborts the whole app on a swizzle channel outside 0...5 (seen as 193 when a surface's description was
+   read short, see makeMappedTexture), so an unknown one falls back to the identity, logged a few times. */
+static MTLTextureSwizzleChannels safe_swizzle(const uint8_t *sw, const uint8_t *desc, size_t desc_len, const char *what) {
+    if (!(sw[0] | sw[1] | sw[2] | sw[3])) /* all Zero: never meant, it would draw nothing; an unread field */
+        return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
+    for (int i = 0; i < 4; i++) {
+        if (sw[i] > MTLTextureSwizzleAlpha) {
+            static int told;
+            if (told++ < 3) {
+                fprintf(stderr, "hengevm: pvg-metal: %s swizzle %u %u %u %u is not a Metal swizzle; using RGBA. desc:", what, sw[0], sw[1], sw[2], sw[3]);
+                for (size_t j = 0; j < desc_len; j++) fprintf(stderr, " %02x", desc[j]);
+                fputc('\n', stderr);
+            }
+            return MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
+        }
+    }
+    return MTLTextureSwizzleChannelsMake(sw[0], sw[1], sw[2], sw[3]);
+}
+
 /* The two serialized forms of a texture description. */
 static MTLTextureDescriptor *descriptor_v1(const uint8_t *d) {
     MTLTextureDescriptor *t = [MTLTextureDescriptor new];
@@ -306,7 +362,9 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     t.width = w, t.height = h, t.depth = depth;
     t.mipmapLevelCount = mips, t.sampleCount = samples, t.arrayLength = array;
     descriptor_common(t, d[0], options);
-    t.swizzle = MTLTextureSwizzleChannelsMake(d[0x23], d[0x24], d[0x25], d[0x26]);
+    t.swizzle = safe_swizzle(d + 0x23, d, 0x27, "texture");
+    if (t.usage & MTLTextureUsageRenderTarget) /* Metal aborts on a swizzled render target */
+        t.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
     return t;
 }
 
@@ -318,7 +376,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     HvObject *o = [replay object:(uint32_t)ref task:task];
     if (!o || !o->object) {
         if (!failure) failure = [NSString stringWithFormat:@"function %llu", ref];
-        return nil;
+        return standIn;
     }
     return o->object;
 }
@@ -332,7 +390,25 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     fprintf(stderr, "hengevm: pvg-metal: %s\n", what.UTF8String);
 }
 
+/* A kernel that does nothing. Metal's deserializer aborts the whole app when a compute pipeline's function is nil, which
+   happens when this OS cannot load the library macOS sent ("This library format is not supported on this platform", seen on
+   iPadOS 17 with macOS 15). The lookup has failed either way, so makeSerialized drops the pipeline: a missing effect, not a
+   crash. */
+- (id)computeStandIn {
+    if (!stand_in) {
+        NSError *err = nil;
+        id<MTLLibrary> lib = [device newLibraryWithSource:@"#include <metal_stdlib>\nkernel void hv_stand_in() {}\n" options:nil error:&err];
+        stand_in = [lib newFunctionWithName:@"hv_stand_in"];
+        if (!stand_in) [self complain:[NSString stringWithFormat:@"stand-in kernel: %@", err.localizedDescription]];
+    }
+    return stand_in;
+}
+
 - (id)makeFunction:(uint64_t)at task:(uint32_t)task {
+    if (getenv("HV_PVG_FAIL_LIBS")) { /* testing: every library refused, as an OS that cannot load them does */
+        [self complain:@"library: refused (HV_PVG_FAIL_LIBS)"];
+        return nil;
+    }
     struct __attribute__((packed)) { uint64_t off; uint32_t len; uint32_t tag, size; } h;
     if (hv_pvg_lite_task_read(lite, task, at, &h, sizeof h)) return nil;
     NSMutableData *lib = [NSMutableData dataWithLength:h.len];
@@ -343,6 +419,15 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
     if (!library) {
         [self complain:[NSString stringWithFormat:@"library: %@", err.localizedDescription]];
         return nil;
+    }
+    {   /* m4 fork: while tracing, keep each library macOS sends, to read its shaders on a Mac */
+        const char *tf = getenv("HV_PVG_TRACE_FILE");
+        if (tf && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) {
+            NSString *dir = [[[NSString stringWithUTF8String:tf] stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"shaders"];
+            [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *name = [NSString stringWithFormat:@"%@-%llx.metallib", library.functionNames.firstObject ?: @"lib", (unsigned long long)at];
+            [lib writeToFile:[dir stringByAppendingPathComponent:name] atomically:NO];
+        }
     }
     return [library newFunctionWithName:library.functionNames.firstObject];
 }
@@ -367,6 +452,18 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         id state = tag == 0xe ? [device newRenderPipelineStateWithDescriptor:descriptor error:&err]
                               : [device newRenderPipelineStateWithTileDescriptor:descriptor options:MTLPipelineOptionNone reflection:nil error:&err];
         if (!state) [self complain:[NSString stringWithFormat:@"pipeline %u: %@", tag, err.localizedDescription]];
+        if (tag == 0xe && getenv("HV_SHADER_DUMP") && atoi(getenv("HV_SHADER_DUMP"))) { /* m4 fork: blend state as this iOS read it */
+            MTLRenderPipelineDescriptor *rp = descriptor;
+            for (int i = 0; i < 4; i++) {
+                MTLRenderPipelineColorAttachmentDescriptor *c = rp.colorAttachments[i];
+                if (c.pixelFormat == MTLPixelFormatInvalid) continue;
+                fprintf(stderr, "hvpipe: %s c%d fmt %lu blend %d rgb %lu*src %lu %lu*dst alpha %lu*src %lu %lu*dst mask %lx\n",
+                        rp.fragmentFunction.name.UTF8String ?: "?", i, (unsigned long)c.pixelFormat, (int)c.blendingEnabled,
+                        (unsigned long)c.sourceRGBBlendFactor, (unsigned long)c.rgbBlendOperation, (unsigned long)c.destinationRGBBlendFactor,
+                        (unsigned long)c.sourceAlphaBlendFactor, (unsigned long)c.alphaBlendOperation, (unsigned long)c.destinationAlphaBlendFactor,
+                        (unsigned long)c.writeMask);
+            }
+        }
         if (state && tag == 0xe && getenv("HV_PVG_TRACE_FILE")) {
             MTLRenderPipelineDescriptor *rp = descriptor;
             objc_setAssociatedObject(state, "hvname", [NSString stringWithFormat:@"%@ / %@ -> fmt %lu blend %d", rp.vertexFunction.name, rp.fragmentFunction.name, (unsigned long)rp.colorAttachments[0].pixelFormat, (int)rp.colorAttachments[0].blendingEnabled], OBJC_ASSOCIATION_RETAIN);
@@ -378,6 +475,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         HvContext *ctx = [HvContext new];
         ctx->replay = self, ctx->task = task;
         dispatch_data_t data = dispatch_data_create((const uint8_t *)all.bytes + 16, w[3], NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        ctx->standIn = [self computeStandIn];
         id descriptor = [spi newComputePipelineDescriptorWithSerializedData:data deserializationContext:ctx];
         if (!descriptor || ctx->failure) {
             [self complain:[NSString stringWithFormat:@"compute descriptor: %@", ctx->failure]];
@@ -558,7 +656,7 @@ static MTLTextureDescriptor *descriptor_v2(const uint8_t *d) {
         if (h.tag == 7) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format];
         else if (h.tag == 8) o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format textureType:(MTLTextureType)v.type levels:levels slices:slices];
         else o->object = [from newTextureViewWithPixelFormat:(MTLPixelFormat)v.format textureType:(MTLTextureType)v.type levels:levels slices:slices
-                                                     swizzle:MTLTextureSwizzleChannelsMake(v.swizzle[0], v.swizzle[1], v.swizzle[2], v.swizzle[3])];
+                                                     swizzle:safe_swizzle(v.swizzle, (const uint8_t *)&v, sizeof v, "view")];
         if (!o->object) [self complain:[NSString stringWithFormat:@"view tag %u of format %lu as %u failed", h.tag, (unsigned long)from.pixelFormat, v.format]];
         return;
     }
@@ -636,6 +734,18 @@ static IOSurfaceRef make_iosurface(HvObject *to, const uint8_t *desc, uint64_t a
         }
     }
     return made;
+}
+
+/* A sample of every 64th byte of the guest's pixels, to tell cheaply whether they changed. */
+static uint64_t guest_hash(HvObject *s) {
+    const uint8_t *from = s->mapped + s->first;
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (uint64_t i = 0; i + 8 <= s->alloc; i += 64) {
+        uint64_t v;
+        memcpy(&v, from + i, 8);
+        hash = (hash ^ v) * 0x100000001b3ull;
+    }
+    return hash;
 }
 
 /* Guest pixels into its IOSurface, when they changed. A sample of every 64th byte says so cheaply. */
@@ -751,19 +861,47 @@ static BOOL sync_iosurface(HvReplay *r, HvObject *s) {
         surfaces[key] = surface;
         if (desc[0x3e] >= 2) {
             surface->alloc = alloc;
-            surface->iosurface = make_iosurface(surface, desc, alloc);
-            if (!surface->iosurface) {
-                NSMutableString *m = [NSMutableString stringWithFormat:@"surface %llu: no IOSurface for its planes (alloc %llu):", h.mapping, alloc];
-                for (int i = 0; i < 96; i++) [m appendFormat:@" %08x", ((const uint32_t *)desc)[i]];
-                [self complain:m];
+            IOSurfaceRef made = make_iosurface(surface, desc, alloc);
+            /* The same guest memory, format and size under another mapping id (another process): the same host
+               IOSurface, or what that process drew is not what this one sees. Its pixels are already there (or
+               drawn over since), so they are not copied again now. */
+            NSString *pk = [NSString stringWithFormat:@"%x/%08x/%llux%llu/%llu", pages[0] & ~1u, surface->fourcc,
+                            (unsigned long long)sw, (unsigned long long)sh, (unsigned long long)alloc];
+            id shared = planar[pk];
+            if (shared && made) {
+                CFRelease(made);
+                surface->iosurface = (IOSurfaceRef)CFRetain((__bridge CFTypeRef)shared);
+                surface->content_hash = guest_hash(surface);
+                surface->content_valid = YES; // shared GPU pixels must not be overwritten by an initial CPU upload
+                static int told;
+                if (told++ < 8) fprintf(stderr, "hengevm: pvg-metal: surface %llu shares the host surface of the same guest memory (%s)\n", h.mapping, pk.UTF8String);
+            } else {
+                surface->iosurface = made;
+                if (made) {
+                    if (planar.count >= 512) [planar removeAllObjects]; /* old ones only lose their sharing */
+                    planar[pk] = (__bridge id)made;
+                }
+                if (!surface->iosurface) {
+                    NSMutableString *m = [NSMutableString stringWithFormat:@"surface %llu: no IOSurface for its planes (alloc %llu):", h.mapping, alloc];
+                    for (int i = 0; i < 96; i++) [m appendFormat:@" %08x", ((const uint32_t *)desc)[i]];
+                    [self complain:m];
+                }
+                sync_iosurface(self, surface);
             }
-            sync_iosurface(self, surface);
         }
         fprintf(stderr, "hengevm: pvg-metal: surface %llu: %lux%lu format %lu, row %llu, %llu KB, fourcc %c%c%c%c planes %u\n", h.mapping, (unsigned long)t.width, (unsigned long)t.height, (unsigned long)t.pixelFormat, row, alloc >> 10, desc[7], desc[6], desc[5], desc[4], desc[0x3e]);
     }
     t.storageMode = MTLStorageModeShared;
     set_framebuffer_only(t, NO);
     t.usage |= MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    /* Metal aborts on a swizzled render target, and a surface is always drawn into here: views over it
+       (tags 7/8/0x1b) can still swizzle. */
+    MTLTextureSwizzleChannels sw = t.swizzle;
+    if (sw.red != MTLTextureSwizzleRed || sw.green != MTLTextureSwizzleGreen || sw.blue != MTLTextureSwizzleBlue || sw.alpha != MTLTextureSwizzleAlpha) {
+        static int told;
+        if (told++ < 3) fprintf(stderr, "hengevm: pvg-metal: surface %llu asked for swizzle %u %u %u %u; drawing it unswizzled\n", h.mapping, sw.red, sw.green, sw.blue, sw.alpha);
+        t.swizzle = MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha);
+    }
     o->surface = surface;
     if (surface->iosurface) {
         uint32_t element_bytes = 0;
@@ -827,6 +965,11 @@ static BOOL sync_iosurface(HvReplay *r, HvObject *s) {
     case OBJ_LINEAR_TEXTURE: case 9: [self makeLinearTexture:o at:at size:size task:task]; break;
     case 13: [self makeHeap:o at:at task:task]; break;
     case 14: [self makeHeapBuffer:o at:at task:task]; break;
+    case 19: /* macOS 27: a buffer, with the same {length, page, flags} entry as type 1 (16 KB ones seen). The guest
+                has object info (tags 450...) written into these, so leaving them out broke its argument buffers:
+                black layers, and "info 450 ... no buffer" over and over */
+        [self makeBuffer:o at:at task:task];
+        break;
     case 0: break; /* an empty slot */
     case OBJ_MAPPED_TEXTURE: [self makeMappedTexture:o at:at task:task]; break;
     default: {
@@ -1127,6 +1270,17 @@ typedef struct {
             offsets[i] = (NSUInteger)U64(12 + i * 12);
         }
         NSRange range = NSMakeRange(index, count);
+        if (tracing) for (uint32_t i = 0; i < count; i++) { /* m4 fork: what the shaders are given */
+            id<MTLBuffer> bb = strong[i];
+            fprintf(stderr, "trace:  %s buf %u ref %u off %lu len %lu:", tag == 125 ? "vtx" : tag == 110 ? "frag" : "tile", index + i, U32(8 + i * 12),
+                    (unsigned long)offsets[i], (unsigned long)bb.length);
+            if (bb && bb.storageMode != MTLStorageModePrivate && offsets[i] < bb.length) {
+                const float *f = (const float *)((const uint8_t *)bb.contents + offsets[i]);
+                NSUInteger nf = MIN((bb.length - offsets[i]) / 4, (NSUInteger)96);
+                for (NSUInteger k = 0; k < nf; k++) fprintf(stderr, " %g", f[k]);
+            }
+            fprintf(stderr, "\n");
+        }
         if (tag == 125) [e setVertexBuffers:buffers offsets:offsets withRange:range];
         else if (tag == 110) [e setFragmentBuffers:buffers offsets:offsets withRange:range];
         else [e setTileBuffers:buffers offsets:offsets withRange:range];
@@ -1537,6 +1691,10 @@ typedef struct {
         else [e dispatchThreads:a threadsPerThreadgroup:b];
         break;
     }
+    case 216: /* {width, height} of the imageblock, 32x32 from macOS 27's glass and blur kernels: without it their
+                 imageblock memory is undefined, and toolbars came out black with coloured blocks */
+        if (r.size >= 8 && U32(0) && U32(4) && U32(0) <= 256 && U32(4) <= 256) [e setImageblockWidth:U32(0) height:U32(4)];
+        break;
     case 219: /* not a command the framework knows either, though the guest sends it */
         break;
     default:
@@ -1641,7 +1799,8 @@ typedef struct {
     uint8_t *out = to && to->mapped && off + 28 <= to->length ? to->mapped + off : NULL;
     id obj = [self get:ref task:task];
     if (!out || !obj) {
-        [self complain:[NSString stringWithFormat:@"info %u: ref %u buffer %u offset %llu: %s", tag, ref, bufref, off, out ? "no object" : "no buffer"]];
+        [self complain:[NSString stringWithFormat:@"info %u: ref %u buffer %u (%s, %llu bytes) offset %llu: %s", tag, ref, bufref,
+                        !to ? "unknown" : to->mapped ? "mapped" : "not mapped", to ? to->length : 0, off, out ? "no object" : "no buffer"]];
         return;
     }
     SEL index_sel = sel_registerName("resourceIndex");
@@ -1891,21 +2050,20 @@ typedef struct {
     return YES;
 }
 
-/* The surface is linear light in half floats: every possible value, to a display byte. */
+/* Every possible half-float value to a display byte, as the screen would show it in the current mode (see hv_half_mode). */
 static const uint8_t *half_to_byte(void) {
-    static uint8_t *table;
-    if (table) return table;
+    static uint8_t *tables[2];
+    int mode = hv_half_mode_get();
+    if (tables[mode]) return tables[mode];
     uint8_t *t = malloc(65536);
     for (uint32_t i = 0; i < 65536; i++) {
         uint16_t bits = (uint16_t)i;
         __fp16 h;
         memcpy(&h, &bits, 2);
         float v = h;
-        if (!(v > 0)) t[i] = 0;
-        else if (v >= 1) t[i] = 255;
-        else t[i] = (uint8_t)((v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1.0f / 2.4f) - 0.055f) * 255.0f + 0.5f);
+        t[i] = !(v > 0) ? 0 : v >= 1 ? 255 : (uint8_t)(hv_half_shown(v, mode) * 255.0f + 0.5f);
     }
-    table = t;
+    tables[mode] = t;
     return t;
 }
 
@@ -1938,9 +2096,16 @@ static const uint8_t *half_to_byte(void) {
     [self drawCursor];
 }
 
+- (BOOL)hasDisplayLayer {
+    os_unfair_lock_lock(&screen_lock);
+    BOOL attached = layer != nil;
+    os_unfair_lock_unlock(&screen_lock);
+    return attached;
+}
+
 /* Puts back what the pointer covered, and draws it where the shared page says it is now. */
 - (void)drawCursor {
-    if (layer) {
+    if ([self hasDisplayLayer]) {
         [self screenChanged];
         return;
     }
@@ -1986,58 +2151,85 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     "  V o; o.at = float4(rect.xy + c * rect.zw, 0, 1); o.uv = float2(c.x, 1 - c.y); return o; }\n"
     "fragment float4 screen_plain(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
     "  return float4(t.sample(s, v.uv).rgb, 1); }\n"
-    "fragment float4 screen_linear(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
+    "fragment float4 screen_linear(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant uint &mode [[buffer(0)]]) {\n"
     "  float3 c = saturate(t.sample(s, v.uv).rgb);\n"
-    "  float3 e = select(1.055 * powr(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308);\n"
-    "  return float4(e, 1); }\n"
+    "  if (mode == 1) c = select(1.055 * powr(c, 1.0 / 2.4) - 0.055, c * 12.92, c <= 0.0031308);\n"
+    "  return float4(c, 1); }\n"
     "fragment float4 screen_cursor(V v [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {\n"
     "  return t.sample(s, v.uv); }\n";
 
-- (BOOL)prepareScreen {
-    if (screen_pipe) return YES;
-    NSError *err = nil;
-    id<MTLLibrary> lib = [device newLibraryWithSource:screen_shaders options:nil error:&err];
-    if (!lib) { [self complain:[NSString stringWithFormat:@"screen shaders: %@", err.localizedDescription]]; return NO; }
-    MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-    d.vertexFunction = [lib newFunctionWithName:@"screen_v"];
-    d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
-    d.fragmentFunction = [lib newFunctionWithName:@"screen_plain"];
-    screen_pipe = [device newRenderPipelineStateWithDescriptor:d error:&err];
-    d.fragmentFunction = [lib newFunctionWithName:@"screen_linear"];
-    linear_pipe = [device newRenderPipelineStateWithDescriptor:d error:&err];
-    d.fragmentFunction = [lib newFunctionWithName:@"screen_cursor"];
-    d.colorAttachments[0].blendingEnabled = YES;
-    d.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
-    d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-    d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-    cursor_pipe = [device newRenderPipelineStateWithDescriptor:d error:&err];
-    MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
-    sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
-    screen_sampler = [device newSamplerStateWithDescriptor:sd];
-    sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
-    cursor_sampler = [device newSamplerStateWithDescriptor:sd];
-    if (!screen_pipe || !linear_pipe || !cursor_pipe || !screen_sampler || !cursor_sampler) {
-        [self complain:[NSString stringWithFormat:@"screen pipelines: %@", err.localizedDescription]];
-        return NO;
+- (BOOL)prepareScreenForLayer:(CAMetalLayer *)target {
+    if (!screen_pipe || !linear_pipe || !cursor_pipe) {
+        NSError *err = nil;
+        id<MTLLibrary> lib = [device newLibraryWithSource:screen_shaders options:nil error:&err];
+        if (!lib) { [self complain:[NSString stringWithFormat:@"screen shaders: %@", err.localizedDescription]]; return NO; }
+        MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
+        d.vertexFunction = [lib newFunctionWithName:@"screen_v"];
+        d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+        d.fragmentFunction = [lib newFunctionWithName:@"screen_plain"];
+        screen_pipe = [device newRenderPipelineStateWithDescriptor:d error:&err];
+        d.fragmentFunction = [lib newFunctionWithName:@"screen_linear"];
+        linear_pipe = [device newRenderPipelineStateWithDescriptor:d error:&err];
+        d.fragmentFunction = [lib newFunctionWithName:@"screen_cursor"];
+        d.colorAttachments[0].blendingEnabled = YES;
+        d.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+        d.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        d.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        d.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        cursor_pipe = [device newRenderPipelineStateWithDescriptor:d error:&err];
+        MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+        sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterLinear;
+        screen_sampler = [device newSamplerStateWithDescriptor:sd];
+        sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+        cursor_sampler = [device newSamplerStateWithDescriptor:sd];
+        if (!screen_pipe || !linear_pipe || !cursor_pipe || !screen_sampler || !cursor_sampler) { [self complain:[NSString stringWithFormat:@"screen pipelines: %@", err.localizedDescription]]; return NO; }
     }
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    layer.device = device;
-    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    layer.framebufferOnly = !getenv("HV_PVG_GPU_TEST");
-    layer.allowsNextDrawableTimeout = YES;
-    layer.maximumDrawableCount = 3;
-    [CATransaction commit];
+    // Pipelines are shared, but a newly connected monitor has a fresh layer.
+    if (prepared_layer != target) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        target.device = device;
+        target.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        target.framebufferOnly = !(getenv("HV_PVG_GPU_TEST") || getenv("HV_COLOR_PROBE")); /* the probe copies the drawable out */
+        target.allowsNextDrawableTimeout = YES;
+        target.maximumDrawableCount = 3;
+        [CATransaction commit];
+        prepared_layer = target;
+        fprintf(stderr, "hengevm: pvg-metal: half-float display surfaces are shown %s (HV_PVG_HALF=%s)\n",
+                hv_half_mode_get() == 1 ? "as LINEAR light with an sRGB encode" : "as display-encoded values, passed through", hv_half_mode_get() == 1 ? "linear" : "encoded/default");
+        if (cp.on) cp_log_layer(self, target);
+    }
     return YES;
 }
 
 /* The display, drawn by the GPU. Waiting for a drawable can take until the screen's next
    refresh, so that happens on a thread of its own and never holds up the guest's GPU work:
    this only says what to show next. Whatever is newest when a drawable comes is what is shown. */
-- (void)kickPresenter {
+- (void)kickPresenter:(BOOL)fresh {
     /* screen_lock held */
-    if (presenter_running) return;
+    if (fresh) screen_requests++;
+    if (presenter_running || !layer || !screen_tex || drawable_retry_pending) return;
+    if (drawable_retry_cooldown) {
+        double delay = drawable_retry_cooldown - now_seconds();
+        if (delay > 0) {
+            if (!fresh) return;
+            // Coalesce fresh work arriving during cooldown; it may be the guest's
+            // last update. Automatic retries alone never reopen an exhausted budget.
+            drawable_retry_pending = YES;
+            uint64_t generation = layer_generation;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), presenter, ^{
+                os_unfair_lock_lock(&self->screen_lock);
+                if (self->layer_generation == generation) {
+                    self->drawable_retry_pending = NO;
+                    self->drawable_retry_cooldown = self->drawable_retry_deadline = 0;
+                    [self kickPresenter:NO];
+                }
+                os_unfair_lock_unlock(&self->screen_lock);
+            });
+            return;
+        }
+        drawable_retry_cooldown = drawable_retry_deadline = 0;
+    }
     presenter_running = YES;
     dispatch_async(presenter, ^{ [self presentLoop]; });
 }
@@ -2061,7 +2253,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     os_unfair_lock_lock(&screen_lock);
     screen_tex = surface->scanout, screen_half = half, screen_w = surface->surface_w, screen_h = surface->surface_h;
     screen_dirty = YES;
-    [self kickPresenter];
+    [self kickPresenter:YES];
     os_unfair_lock_unlock(&screen_lock);
 }
 
@@ -2070,7 +2262,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
     os_unfair_lock_lock(&screen_lock);
     if (screen_tex) {
         screen_dirty = YES;
-        [self kickPresenter];
+        [self kickPresenter:YES];
     }
     os_unfair_lock_unlock(&screen_lock);
 }
@@ -2078,41 +2270,79 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
 - (void)presentLoop {
     for (;;) @autoreleasepool {
         os_unfair_lock_lock(&screen_lock);
-        if (!screen_dirty) {
+        if (!screen_dirty || !layer) {
             presenter_running = NO;
             os_unfair_lock_unlock(&screen_lock);
             return;
         }
         screen_dirty = NO;
+        CAMetalLayer *target = layer; // retained across nextDrawable and a concurrent disconnect
+        uint64_t generation = layer_generation, requests = screen_requests;
         id<MTLTexture> tex = screen_tex, ctex = cursor_tex;
         BOOL half = screen_half, shown = cursor_shown;
         uint32_t W = screen_w, H = screen_h, cw0 = cursor_w, ch0 = cursor_h;
         int hx = cursor_hot_x, hy = cursor_hot_y;
         os_unfair_lock_unlock(&screen_lock);
-        if (![self prepareScreen]) continue;
+        if (![self prepareScreenForLayer:target]) {
+            os_unfair_lock_lock(&screen_lock);
+            BOOL changed = layer_generation != generation;
+            if (!changed) presenter_running = NO;
+            os_unfair_lock_unlock(&screen_lock);
+            if (changed) continue;
+            return;
+        }
         CGSize want = CGSizeMake(W, H);
-        if (!CGSizeEqualToSize(layer.drawableSize, want)) {
+        if (!CGSizeEqualToSize(target.drawableSize, want)) {
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
-            layer.drawableSize = want;
+            target.drawableSize = want;
             [CATransaction commit];
         }
-        id<CAMetalDrawable> drawable = [layer nextDrawable]; /* the wait is here */
+        id<CAMetalDrawable> drawable = [target nextDrawable]; /* the wait is here */
         if (!drawable) {
             os_unfair_lock_lock(&screen_lock);
             screen_dirty = YES;
+            BOOL changed = layer_generation != generation;
+            if (!changed) {
+                presenter_running = NO;
+                double now = now_seconds();
+                if (!drawable_retry_deadline) drawable_retry_deadline = now + 2;
+                BOOL exhausted = now >= drawable_retry_deadline;
+                if (exhausted) {
+                    drawable_retry_cooldown = now + 1;
+                    // A fresh frame/cursor event received while nextDrawable waited
+                    // must not lose its wakeup at the transition into cooldown.
+                    if (screen_requests != requests) [self kickPresenter:YES];
+                } else {
+                    // A monitor can connect before its first drawable is available.
+                    // Retry even if the guest is idle, but never poll a hidden target forever.
+                    drawable_retry_pending = YES;
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), presenter, ^{
+                        os_unfair_lock_lock(&self->screen_lock);
+                        if (self->layer_generation == generation) {
+                            self->drawable_retry_pending = NO;
+                            [self kickPresenter:NO];
+                        }
+                        os_unfair_lock_unlock(&self->screen_lock);
+                    });
+                }
+            }
             os_unfair_lock_unlock(&screen_lock);
-            usleep(4000);
-            continue;
+            if (changed) continue;
+            return;
         }
         /* Something newer came during the wait? Then that is the frame to show. */
         os_unfair_lock_lock(&screen_lock);
         tex = screen_tex, half = screen_half, ctex = cursor_tex, shown = cursor_shown;
         cw0 = cursor_w, ch0 = cursor_h, hx = cursor_hot_x, hy = cursor_hot_y;
+        BOOL same_target = layer_generation == generation && layer == target;
         BOOL same_size = screen_w == W && screen_h == H;
-        screen_dirty = NO;
+        if (same_target && same_size) {
+            screen_dirty = NO;
+            drawable_retry_deadline = 0;
+        }
         os_unfair_lock_unlock(&screen_lock);
-        if (!same_size) { /* a mode change: start over with the right size */
+        if (!same_target || !same_size) { /* a target or mode change during nextDrawable */
             os_unfair_lock_lock(&screen_lock);
             screen_dirty = YES;
             os_unfair_lock_unlock(&screen_lock);
@@ -2124,13 +2354,15 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
         pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
         pass.colorAttachments[0].storeAction = MTLStoreActionStore;
         id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:pass];
-        NSNumber *linearSetting = [[NSUserDefaults standardUserDefaults] objectForKey:@"henge.display.linearToSRGB"];
-        BOOL convertLinear = linearSetting ? linearSetting.boolValue : YES;
-        [e setRenderPipelineState:(half && convertLinear) ? linear_pipe : screen_pipe];
+        [e setRenderPipelineState:half ? linear_pipe : screen_pipe];
         float rect[4] = {-1, -1, 2, 2};
         [e setVertexBytes:rect length:sizeof rect atIndex:0];
         [e setFragmentTexture:tex atIndex:0];
         [e setFragmentSamplerState:screen_sampler atIndex:0];
+        if (half) {
+            uint32_t half_mode = (uint32_t)hv_half_mode_get();
+            [e setFragmentBytes:&half_mode length:sizeof half_mode atIndex:0];
+        }
         [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         const uint8_t *page = hv_pvg_lite_display_page(lite);
         uint32_t where = page ? __atomic_load_n((const uint32_t *)(page + 0xe00), __ATOMIC_ACQUIRE) : 0xffffffff;
@@ -2147,6 +2379,7 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
             [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         }
         [e endEncoding];
+        if (cp.on) cp_capture_post(self, drawable.texture, W, H, cb);
 #if !TARGET_OS_IPHONE
         if (getenv("HV_PVG_GPU_TEST")) { /* the same pixels for a screenshot: this is the path a phone runs */
             NSUInteger bytes = (NSUInteger)W * H * 4;
@@ -2168,16 +2401,26 @@ static NSString *const screen_shaders = @"#include <metal_stdlib>\n"
             }];
         }
 #endif
-        [cb presentDrawable:drawable];
-        [cb commit];
-        gpu_frames++;
+        // Serialize the final check and commit with set_layer: a switch that has
+        // returned must not be followed by a commit to its old target.
+        os_unfair_lock_lock(&screen_lock);
+        if (layer_generation == generation && layer == target) {
+            [cb presentDrawable:drawable];
+            [cb commit];
+            gpu_frames++;
+        } else {
+            screen_dirty = YES;
+        }
+        os_unfair_lock_unlock(&screen_lock);
     }
 }
 
 /* What the display should show: at most a few times a second by CPU, for tests and the boot's first frames. */
 - (void)present:(uint64_t)mapping {
     double now = now_seconds();
-    if (layer) {
+    on_screen = mapping;
+    if ([self hasDisplayLayer]) {
+        late = NO;
         [self showOnLayer:mapping];
         return;
     }
@@ -2271,9 +2514,11 @@ HvPvgMetal *hv_pvg_metal_create(HvPvgLite *lite) {
         r->tasks = [NSMutableDictionary new];
         r->mapped_textures = [NSMutableDictionary new];
         r->surfaces = [NSMutableDictionary new];
+        r->planar = [NSMutableDictionary new];
         r->complaints = [NSMutableSet new];
         r->video_view_layouts = [NSMutableSet new];
         r->shot = getenv("HV_PVG_SHOT");
+        cp_start(r);
 #if !TARGET_OS_IPHONE
         if (getenv("HV_PVG_GPU_TEST")) r->layer = [CAMetalLayer layer];
 #endif
@@ -2320,11 +2565,14 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
                     hv_pvg_lite_command(lite, cmd, len);
                     if (op == 8 && n >= 16) {
                         if (r->tracing) fprintf(stderr, "trace: swap to %llu\n", (uint64_t)args[3] << 32 | args[2]);
+                        cp_note_swap(r, (uint64_t)args[3] << 32 | args[2], args, n);
                         [r present:(uint64_t)args[3] << 32 | args[2]];
                     }
                     if (op == 4) [r cursorGlyph:args length:n];
                     if (op == 5 && n >= 8) {
+                        os_unfair_lock_lock(&r->screen_lock);
                         r->cursor_shown = args[1] & 1;
+                        os_unfair_lock_unlock(&r->screen_lock);
                         if (getenv("HV_PVG_CURSOR_LOG")) fprintf(stderr, "pvgcursor show %u\n", args[1]);
                         [r drawCursor];
                     }
@@ -2339,10 +2587,19 @@ void hv_pvg_metal_submit(HvPvgMetal *m, HvPvgLite *lite, uint32_t ch, uint32_t *
 }
 
 void hv_pvg_metal_set_layer(HvPvgMetal *m, void *layer) {
+    if (!m) return;
     HvReplay *r = (__bridge HvReplay *)m;
     CAMetalLayer *l = (__bridge CAMetalLayer *)layer;
+    // Invalidate immediately, even when the guest GPU worker has a backlog.
+    os_unfair_lock_lock(&r->screen_lock);
+    r->layer_generation++; /* reattaching the same layer also wakes a stopped presenter */
+    r->layer = l;
+    r->drawable_retry_pending = NO;
+    r->drawable_retry_deadline = r->drawable_retry_cooldown = 0;
+    r->screen_dirty = YES;
+    [r kickPresenter:YES];
+    os_unfair_lock_unlock(&r->screen_lock);
     dispatch_async(r->worker, ^{
-        r->layer = l;
         if (r->on_screen) [r present:r->on_screen];
     });
 }
@@ -2352,8 +2609,9 @@ uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m) {
 }
 
 void hv_pvg_metal_cursor_moved(HvPvgMetal *m) {
+    if (!m) return;
     HvReplay *r = (__bridge HvReplay *)m;
-    if (r->layer) { /* no need to queue behind the guest's GPU work */
+    if ([r hasDisplayLayer]) { /* no need to queue behind the guest's GPU work */
         [r screenChanged];
         return;
     }
@@ -2402,9 +2660,7 @@ int hv_pvg_metal_snapshot(HvPvgMetal *m, uint8_t *bgra, uint32_t w, uint32_t h) 
                 }
                 const __fp16 *p = (const __fp16 *)(src + sx * 8);
                 for (int c = 0; c < 3; c++) {
-                    float v = (float)p[c];
-                    v = v < 0 ? 0 : v > 1 ? 1 : v;
-                    v = v <= 0.0031308f ? v * 12.92f : 1.055f * powf(v, 1 / 2.4f) - 0.055f; /* the surface is linear light */
+                    float v = hv_half_shown((float)p[c], hv_half_mode_get()); /* as the screen shows it */
                     sum[2 - c] += (uint32_t)(v * 255 + 0.5f);
                 }
             }

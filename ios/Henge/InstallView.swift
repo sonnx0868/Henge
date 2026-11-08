@@ -3,6 +3,9 @@ import SwiftUI
 /// Download macOS (or use a copy already on this device) and install it on a new Mac.
 struct InstallView: View {
     @ObservedObject private var installer = Installer.shared
+    @ObservedObject private var jit = JITCoordinator.shared
+    @State private var jitReady = JITBootstrap.ready
+    @StateObject private var display = DisplayRouter()
     @State private var release = MacOSRelease.all.first(where: Installer.haveImage) ?? MacOSRelease.all[0]
     @State private var name = "Mac"
     @State private var ramGB = Device.suggestedRAMGB
@@ -31,6 +34,12 @@ struct InstallView: View {
             }
             .background(Desk.page)
             .navigationTitle(installer.busy ? "Installing" : "Install macOS")
+            .task {
+                while !Task.isCancelled { // the region may be claimed after a hand-off to StikDebug
+                    jitReady = JITBootstrap.ready
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+            }
         }
     }
 
@@ -40,8 +49,22 @@ struct InstallView: View {
         DeskHeading("Version")
         VStack(spacing: 0) {
             ForEach(MacOSRelease.all) { r in
-                Button { release = r } label: { versionRow(r) }
-                    .buttonStyle(.plain)
+                HStack(spacing: 0) {
+                    Button { release = r } label: { versionRow(r) }
+                        .buttonStyle(.plain)
+                    if Installer.haveImage(r) && !installer.busy { // restore images are 15-25 GB: deleting one should be easy to find
+                        Button { confirmDeleteDownload = r } label: {
+                            Image(systemName: "trash")
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundStyle(Desk.dim)
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Delete the \(r.name) download")
+                        .padding(.trailing, 6)
+                    }
+                }
                     .contextMenu {
                         if Installer.haveImage(r) {
                             Button("Delete Download", role: .destructive) { confirmDeleteDownload = r }
@@ -77,6 +100,14 @@ struct InstallView: View {
             }
             .padding(.horizontal, 17)
             .padding(.vertical, 10)
+            if let note = Device.memoryNote(ramGB) {
+                Text(note)
+                    .font(.system(size: 13))
+                    .foregroundStyle(Desk.dim)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 17)
+                    .padding(.bottom, 10)
+            }
             Rectangle().fill(Desk.hairline).frame(height: 0.5)
             Toggle("Delete the download after", isOn: $deleteAfter)
                 .font(.system(size: 16))
@@ -88,15 +119,21 @@ struct InstallView: View {
         Button(Installer.haveImage(release) ? "Install" : "Download and Install") {
             installer.start(release, name: name.isEmpty ? "Mac" : name, ramMB: ramGB * 1024, cpus: cpus, keepImage: !deleteAfter)
         }
-        .buttonStyle(DeskButtonStyle(enabled: JITBootstrap.ready && !Device.chipTooOld))
-        .disabled(!JITBootstrap.ready || Device.chipTooOld)
+        .buttonStyle(DeskButtonStyle(enabled: jitReady && !Device.chipTooOld))
+        .disabled(!jitReady || Device.chipTooOld)
         .padding(.top, 20)
-        Text(Device.chipTooOld ? Device.chipTooOldText : JITBootstrap.ready ? "Keep Henge open and the \(Device.name) plugged in. Needs about \(ByteText.string(UInt64(Installer.spaceNeeded(release)))) free."
-                                : "Turn on JIT first.")
+        Text(Device.chipTooOld ? Device.chipTooOldText : jitReady ? "Keep Henge open and the \(Device.name) plugged in. Needs about \(ByteText.string(UInt64(Installer.spaceNeeded(release)))) free."
+                                : JITBootstrap.lastFailure ?? "Turn on JIT first. \(jit.automaticDescription)")
             .font(.system(size: 13))
             .foregroundStyle(Desk.dim)
             .multilineTextAlignment(.center)
             .padding(.top, 10)
+        if !jitReady && !Device.chipTooOld {
+            // Before any Mac exists, this is the only place to ask for JIT (#23).
+            Button("Turn On JIT") { jit.enable() }
+                .buttonStyle(DeskButtonStyle())
+                .padding(.top, 12)
+        }
     }
 
     private func versionRow(_ r: MacOSRelease) -> some View {
@@ -213,7 +250,7 @@ struct InstallView: View {
         if details {
             VStack(spacing: 12) {
                 if case .installing = installer.phase {
-                    BootDisplay()
+                    BootDisplay(display: display, role: .device)
                         .aspectRatio(16.0 / 10.0, contentMode: .fit)
                         .clipShape(RoundedRectangle(cornerRadius: 15, style: .continuous))
                 }

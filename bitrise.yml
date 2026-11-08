@@ -7,6 +7,16 @@ meta:
     stack: osx-xcode-latest-stable
 
 workflows:
+  check_integration:
+    steps:
+      - git-clone@8: {}
+      - script@1:
+          title: Check upstream integration and iOS sources
+          inputs:
+            - content: |-
+                #!/usr/bin/env bash
+                set -euo pipefail
+                bash ci/check-integration.sh
   check_scroll:
     steps:
       - git-clone@8: {}

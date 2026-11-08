@@ -7,6 +7,11 @@ import CoreGraphics
 /// progress bar (a virtual Mac's firmware draws no logo into it), so the logo
 /// over it is the app's own.
 struct BootDisplay: View {
+    let display: DisplayRouter
+    let role: DisplayTargetSelection.Role
+    /// The id this view's layer connects to the router under.
+    var surface = UUID()
+
     @State private var image: CGImage?
     @State private var gpuLive = false
     @AppStorage("henge.matchScreenColors") private var matchScreenColors = true
@@ -29,7 +34,8 @@ struct BootDisplay: View {
                         .foregroundStyle(.white)
                 }
             }
-            GPUScreen(matchScreenColors: matchScreenColors, brightness: screenBrightness)
+            GPUScreen(display: display, role: role, surface: surface,
+                      matchScreenColors: matchScreenColors, brightness: screenBrightness)
                 .allowsHitTesting(false)
         }
         .task {
@@ -63,12 +69,63 @@ struct BootDisplay: View {
 
 /// A layer the engine draws the Mac's frames into, with the GPU, without the main thread.
 private struct GPUScreen: UIViewRepresentable {
+    let display: DisplayRouter
+    let role: DisplayTargetSelection.Role
+    let surface: UUID
     let matchScreenColors: Bool
     let brightness: Double
     private static let srgb = CGColorSpace(name: CGColorSpace.sRGB)
 
     final class Screen: UIView {
         override class var layerClass: AnyClass { CAMetalLayer.self }
+
+        private let id: UUID
+        private let display: DisplayRouter
+        private let role: DisplayTargetSelection.Role
+        private var attached = false
+        private var lastSize: CGSize = .zero
+
+        init(display: DisplayRouter, role: DisplayTargetSelection.Role, surface: UUID) {
+            self.id = surface
+            self.display = display
+            self.role = role
+            super.init(frame: .zero)
+            backgroundColor = .clear
+            isOpaque = false
+            layer.contentsGravity = .resizeAspect
+            layer.isOpaque = false
+        }
+
+        required init?(coder: NSCoder) { fatalError("made in code") }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if window == nil { detach() } else { attachIfReady() }
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            attachIfReady()
+        }
+
+        private func attachIfReady() {
+            guard window != nil, bounds.width > 0, bounds.height > 0,
+                  let metal = layer as? CAMetalLayer else { return }
+            if !attached {
+                attached = true
+                lastSize = bounds.size
+                display.connect(id, layer: metal, role: role)
+            } else if lastSize != bounds.size {
+                lastSize = bounds.size
+                display.refresh(id)
+            }
+        }
+
+        func detach() {
+            guard attached else { return }
+            attached = false
+            display.disconnect(id)
+        }
     }
 
     private func setColorSpace(_ view: Screen) {
@@ -80,15 +137,18 @@ private struct GPUScreen: UIViewRepresentable {
     }
 
     func makeUIView(context: Context) -> Screen {
-        let view = Screen()
-        view.backgroundColor = .clear
-        view.isOpaque = false
-        view.layer.contentsGravity = .resizeAspect
-        view.layer.isOpaque = false
+        if ProcessInfo.processInfo.environment["HV_COLOR_PROBE"] != nil {
+            // What the screen itself is, for the colour probe (the engine logs the layer and the frames).
+            let s = UIScreen.main
+            let gamut = s.traitCollection.displayGamut == .P3 ? "P3" : s.traitCollection.displayGamut == .SRGB ? "sRGB" : "unspecified"
+            HengeLog.log("colorprobe", "colorprobe: v=1 src=swift event=screen gamut=\(gamut) scale=\(s.scale) nativeScale=\(s.nativeScale) "
+                       + "bounds=\(Int(s.bounds.width))x\(Int(s.bounds.height)) maxEDR=\(s.potentialEDRHeadroom) currentEDR=\(s.currentEDRHeadroom) "
+                       + "brightness=\(String(format: "%.2f", s.brightness)) refreshHz=\(s.maximumFramesPerSecond)")
+        }
+        let view = Screen(display: display, role: role, surface: surface)
         setColorSpace(view)
-        henge_vm_set_display_layer(Unmanaged.passUnretained(view.layer).toOpaque())
         return view
     }
-
     func updateUIView(_ view: Screen, context: Context) { setColorSpace(view) }
+    static func dismantleUIView(_ view: Screen, coordinator: ()) { view.detach() }
 }

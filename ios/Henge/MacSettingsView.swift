@@ -37,9 +37,8 @@ struct MacSettingsView: View {
                         }
                     }
                     .pickerStyle(.menu)
-                    if Device.memoryChoicesGB.contains(12) {
-                        Text("10–12 GB leaves less memory for iPadOS, JIT and graphics. Compare 10 GB before trying 12 GB; a larger guest can increase memory pressure. Applies the next time this Mac starts.")
-                            .font(.system(size: 13)).foregroundStyle(Desk.dim)
+                    if let note = Device.memoryNote(mac.ramMB / 1024) {
+                        Text(note).font(.system(size: 13)).foregroundStyle(Desk.dim)
                     }
                 }
                 .padding(17)
@@ -57,10 +56,11 @@ struct MacSettingsView: View {
                 .padding(.vertical, 10)
                 .deskCard()
 
-                if Device.isPad {
+                if Device.fittingScreen.height != 1080 {
                     DeskHeading("Screen")
                     VStack(alignment: .leading, spacing: 12) {
                         Picker("Screen", selection: Binding(get: {
+                            if mac.isRetina { return "retina" }
                             if mac.screen.width == Device.lowLoadScreen.width,
                                mac.screen.height == Device.lowLoadScreen.height { return "lowLoad" }
                             if mac.screen.width == Device.performanceScreen.width,
@@ -68,21 +68,26 @@ struct MacSettingsView: View {
                             if mac.screen.width == 1920, mac.screen.height == 1080 { return "wide" }
                             return "fit"
                         }, set: { choice in
+                            mac.retina = choice == "retina"
                             switch choice {
                             case "lowLoad": (mac.screenWidth, mac.screenHeight) = Device.lowLoadScreen
+                            case "retina": break
                             case "performance": (mac.screenWidth, mac.screenHeight) = Device.performanceScreen
                             case "wide": (mac.screenWidth, mac.screenHeight) = (1920, 1080)
                             default: (mac.screenWidth, mac.screenHeight) = Device.fittingScreen
                             }
                             save()
                         })) {
-                            Text("Performance").tag("performance")
-                            Text("Low load").tag("lowLoad")
-                            Text("Fit this iPad").tag("fit")
+                            if Device.isPad {
+                                Text("Retina").tag("retina")
+                                Text("Performance").tag("performance")
+                                Text("Low load").tag("lowLoad")
+                            }
+                            Text("Fit this \(Device.name)").tag("fit")
                             Text("16:9").tag("wide")
                         }
                         .pickerStyle(.segmented)
-                        Text("\(mac.screen.width) × \(mac.screen.height). Low load renders about 19% fewer pixels than Performance. Changes apply the next time this Mac starts.")
+                        Text("\(mac.screen.width) × \(mac.screen.height). \(Device.isPad ? "Low load renders about 19% fewer pixels than Performance. " : "")Changes apply the next time this Mac starts.")
                             .font(.system(size: 13)).foregroundStyle(Desk.dim)
                     }
                     .padding(17)
