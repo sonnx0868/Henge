@@ -50,7 +50,9 @@ static time_t agent_seen;
 static pthread_mutex_t scroll_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t scroll_cond = PTHREAD_COND_INITIALIZER;
 static double scroll_x, scroll_y, scroll_scale = 0.3;
-static int scroll_active;
+static double wheel_x, wheel_y, wheel_scale = 0.3;
+static int64_t wheel_motion_ms;
+static int scroll_active, scroll_has_wheel;
 static unsigned long scroll_client;
 static int64_t scroll_seen_ms, scroll_motion_ms;
 
@@ -63,6 +65,32 @@ static int64_t monotonic_ms(void) {
 int hv_share_scroll_ready(void) {
     pthread_mutex_lock(&scroll_mu);
     int ready = scroll_active && monotonic_ms() - scroll_seen_ms < 2000;
+    pthread_mutex_unlock(&scroll_mu);
+    return ready;
+}
+
+int hv_share_scroll_wheel_ready(void) {
+    pthread_mutex_lock(&scroll_mu);
+    int ready = scroll_active && scroll_has_wheel && monotonic_ms() - scroll_seen_ms < 2000;
+    pthread_mutex_unlock(&scroll_mu);
+    return ready;
+}
+
+int hv_share_scroll_wheel(double dx, double dy, double scale) {
+    if (!isfinite(dx) || !isfinite(dy) || !isfinite(scale) || scale < 0.1 || scale > 1.5) return 0;
+    pthread_mutex_lock(&scroll_mu);
+    int64_t now = monotonic_ms();
+    int ready = scroll_active && scroll_has_wheel && now - scroll_seen_ms < 2000;
+    if (ready) {
+        if (now - wheel_motion_ms > 500) wheel_x = wheel_y = 0;
+        // Eight maximum-gain notches bound catch-up, without the pad's 32/64
+        // raw-pixel caps swallowing a normal fast wheel burst.
+        wheel_x = fmin(fmax(wheel_x + fmin(fmax(dx, -256), 256) * (scale / 0.3), -1280), 1280);
+        wheel_y = fmin(fmax(wheel_y + fmin(fmax(dy, -256), 256) * (scale / 0.3), -1280), 1280);
+        wheel_scale = scale;
+        wheel_motion_ms = now;
+        pthread_cond_signal(&scroll_cond);
+    }
     pthread_mutex_unlock(&scroll_mu);
     return ready;
 }
@@ -702,35 +730,46 @@ static int scroll_stream(Conn *c, Request *r) {
     if (send_all(c->fd, headers, sizeof headers - 1) != 0) return -1;
     pthread_mutex_lock(&scroll_mu);
     unsigned long client = ++scroll_client;
+    // Query negotiation preserves the original three-number v2 stream for
+    // installed helpers. New helpers can still consume an old app's v2 reply.
+    int with_wheel = strcmp(r->query, "wheel=1") == 0;
     scroll_x = scroll_y = 0;
+    wheel_x = wheel_y = 0;
     scroll_seen_ms = monotonic_ms();
     scroll_active = 1;
-    fprintf(stderr, "henge: precise scroll protocol v2 connected\n");
+    scroll_has_wheel = with_wheel;
+    fprintf(stderr, "henge: precise scroll protocol %s connected\n", with_wheel ? "v3 (separate wheel)" : "v2");
     pthread_cond_broadcast(&scroll_cond);
     pthread_mutex_unlock(&scroll_mu);
-    int rc = 0;
+    int rc = 0, last_wheel = 0;
     for (;;) {
         struct timeval now;
         gettimeofday(&now, NULL);
         struct timespec until = {.tv_sec = now.tv_sec + 1, .tv_nsec = now.tv_usec * 1000};
         pthread_mutex_lock(&scroll_mu);
-        while (client == scroll_client && !scroll_x && !scroll_y) {
+        while (client == scroll_client && !scroll_x && !scroll_y && !(with_wheel && (wheel_x || wheel_y))) {
             if (pthread_cond_timedwait(&scroll_cond, &scroll_mu, &until) == ETIMEDOUT) break;
         }
         if (client != scroll_client) { pthread_mutex_unlock(&scroll_mu); break; }
-        double x = scroll_x, y = scroll_y, scale = scroll_scale;
-        if (monotonic_ms() - scroll_motion_ms > 100) x = y = 0;
-        scroll_x = scroll_y = 0;
+        // Alternate when both devices have pending input so neither starves.
+        int wheel = with_wheel && (wheel_x || wheel_y) && (last_wheel == 0 || (!scroll_x && !scroll_y));
+        double x = wheel ? wheel_x : scroll_x, y = wheel ? wheel_y : scroll_y;
+        double scale = wheel ? wheel_scale : scroll_scale;
+        if (monotonic_ms() - (wheel ? wheel_motion_ms : scroll_motion_ms) > (wheel ? 500 : 100)) x = y = 0;
+        if (wheel) wheel_x = wheel_y = 0;
+        else scroll_x = scroll_y = 0;
+        last_wheel = wheel;
         pthread_mutex_unlock(&scroll_mu);
         char line[128];
-        int n = snprintf(line, sizeof line, "%.6f %.6f %.6f\n", x, y, scale);
+        int n = with_wheel ? snprintf(line, sizeof line, "%c %.6f %.6f %.6f\n", wheel ? 'W' : 'P', x, y, scale)
+                           : snprintf(line, sizeof line, "%.6f %.6f %.6f\n", x, y, scale);
         if ((rc = send_all(c->fd, line, (size_t)n)) != 0) break;
         pthread_mutex_lock(&scroll_mu);
         if (client == scroll_client) scroll_seen_ms = monotonic_ms();
         pthread_mutex_unlock(&scroll_mu);
     }
     pthread_mutex_lock(&scroll_mu);
-    if (client == scroll_client) { scroll_active = 0; scroll_x = scroll_y = 0; }
+    if (client == scroll_client) { scroll_active = scroll_has_wheel = 0; scroll_x = scroll_y = wheel_x = wheel_y = 0; }
     pthread_mutex_unlock(&scroll_mu);
     r->close = 1;
     return rc;
@@ -743,13 +782,16 @@ static int scroll_report(Conn *c, Request *r) {
     double scale, raw_x, raw_y, delay;
     long long x, y, point_x, point_y;
     unsigned frames, dropped;
-    int ok = sscanf(body, "%lf %lf %lf %lld %lld %lld %lld %u %lf %u", &scale, &raw_x, &raw_y,
-                    &x, &y, &point_x, &point_y, &frames, &delay, &dropped) == 10;
+    char kind = 'P';
+    int fields = sscanf(body, "%lf %lf %lf %lld %lld %lld %lld %u %lf %u %c", &scale, &raw_x, &raw_y,
+                        &x, &y, &point_x, &point_y, &frames, &delay, &dropped, &kind);
+    int ok = fields >= 10 && (kind == 'P' || kind == 'W');
     free(body);
     if (!ok || !isfinite(scale) || !isfinite(raw_x) || !isfinite(raw_y) || !isfinite(delay))
         return respond_empty(c, r, 400, "Bad Request");
-    fprintf(stderr, "henge: scroll applied: scale %.3f raw %.2f %.2f requested pixels %lld %lld CG points %lld %lld frames %u max queue %.1f ms stale %u\n",
-            scale, raw_x, raw_y, x, y, point_x, point_y, frames, delay, dropped);
+    fprintf(stderr, "henge: %s applied: scale %.3f %s %.2f %.2f requested pixels %lld %lld CG points %lld %lld frames %u max queue %.1f ms stale %u\n",
+            kind == 'W' ? "wheel" : "scroll", scale, kind == 'W' ? "received pixels" : "raw", raw_x, raw_y,
+            x, y, point_x, point_y, frames, delay, dropped);
     return respond_empty(c, r, 204, "No Content");
 }
 

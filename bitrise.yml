@@ -7,6 +7,21 @@ meta:
     stack: osx-xcode-latest-stable
 
 workflows:
+  check_scroll:
+    steps:
+      - git-clone@8: {}
+      - script@1:
+          title: Check wheel transport and Mac helper
+          inputs:
+            - content: |-
+                #!/usr/bin/env bash
+                set -euo pipefail
+                make build/test_scroll_bridge build/test_scroll_pixels build/henge-agent
+                swiftc -parse-as-library ios/Henge/ScrollMotion.swift tests/test_scroll_motion.swift -o build/test_scroll_motion
+                swiftc -frontend -parse ios/Henge/Hardware.swift ios/Henge/MouseScrollSettings.swift ios/Henge/SessionView.swift
+                build/test_scroll_bridge
+                build/test_scroll_pixels
+                build/test_scroll_motion
   build_ipa:
     triggers:
       push:

@@ -46,7 +46,7 @@ IDR_SRC = $(wildcard third_party/idevicerestore/src/*.c)
 RESTORE_OBJ = $(patsubst third_party/%.c,$(RB)/%.o,$(IRECV_SRC) $(MUXD_SRC) $(IDR_SRC))
 
 # The helper that runs inside macOS on a virtual Mac (share.c serves it to the guest).
-$(B)/henge-agent: tools/henge-agent.m tools/scroll_pixels.h
+$(B)/henge-agent: tools/henge-agent.m tools/scroll_pixels.h tools/scroll_wheel.h
 	@mkdir -p $(B)
 	env -u SDKROOT -u IPHONEOS_DEPLOYMENT_TARGET xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=12.0 -fobjc-arc -Wall -Wextra -O2 -framework AppKit -framework ApplicationServices $< -o $@
 	codesign -f -s - $@
@@ -89,7 +89,7 @@ $(B)/test_scroll_bridge: tests/test_scroll_bridge.c $(B)/share.o
 	$(CC) $(CFLAGS) tests/test_scroll_bridge.c $(B)/share.o -o $@
 $(B)/test_jit_script: tests/test_jit_script.m | $(B)
 	$(CC) -fobjc-arc -O2 -Wall -Wextra $< -framework Foundation -framework JavaScriptCore -o $@
-$(B)/test_scroll_pixels: tests/test_scroll_pixels.c tools/scroll_pixels.h | $(B)
+$(B)/test_scroll_pixels: tests/test_scroll_pixels.c tools/scroll_pixels.h tools/scroll_wheel.h | $(B)
 	$(CC) $(CFLAGS) tests/test_scroll_pixels.c -o $@
 $(B)/test_pvg_video_layout: tests/test_pvg_video_layout.c devices/pvg_video_layout.h | $(B)
 	$(CC) $(CFLAGS) tests/test_pvg_video_layout.c -o $@

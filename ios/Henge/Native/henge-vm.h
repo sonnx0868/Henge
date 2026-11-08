@@ -55,6 +55,8 @@ void henge_vm_mouse_button(int button, int down);
 /* Wheel units: dy > 0 up, dx > 0 right. */
 void henge_vm_mouse_scroll(int dx, int dy);
 int henge_vm_mouse_scroll_motion(double dx, double dy, double scale);
+int henge_vm_mouse_scroll_wheel(double dx, double dy, double scale);
+int henge_vm_pixel_wheel_ready(void);
 int henge_vm_pixel_scroll_ready(void);
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int henge_vm_pointer(int *x, int *y);

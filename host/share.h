@@ -18,5 +18,8 @@ long hv_share_agent_seen(void);
 /* Precise scroll stream consumed by the guest helper after Accessibility is granted. */
 int hv_share_scroll_ready(void);
 int hv_share_scroll_motion(double dx, double dy, double scale);
+/* Explicit wheel stream: gain is applied before coalescing, separately from pads. */
+int hv_share_scroll_wheel_ready(void);
+int hv_share_scroll_wheel(double dx, double dy, double scale);
 
 #endif

@@ -23,7 +23,10 @@ struct ScrollMotion {
         var dx = x, dy = y
         if abs(dy) > 2 * abs(dx) { dx = 0 }
         else if abs(dx) > 2 * abs(dy) { dy = 0 }
-        let limit: Float = kind == .wheel ? 32 : 16
+        // Preserve up to eight wheel units in a coalesced burst. One wheel
+        // frame is not one notch: clipping five fast notches to 32 here made
+        // them travel one fifth as far as five isolated notches.
+        let limit: Float = kind == .wheel ? 256 : 16
         dx = min(max(dx, -limit), limit)
         dy = min(max(dy, -limit), limit)
         x = 0

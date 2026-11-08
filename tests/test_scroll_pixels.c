@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include "../tools/scroll_pixels.h"
+#include "../tools/scroll_wheel.h"
 
 #define CHECK(condition, message) do { if (!(condition)) { fprintf(stderr, "FAIL: %s\n", message); return 1; } } while (0)
 
@@ -34,6 +35,39 @@ int main(void) {
     for (int i = 0; i < 5; i++)
         CHECK(hv_scroll_pixels_apply(&wheel, 0, 32, 0.3).y == 32, "converted isolated wheel unit survives guest delivery");
     CHECK(hv_scroll_pixels_apply(&wheel, -4, 0, 0.3).x == -4, "fractional horizontal wheel conversion survives guest delivery");
+    HvScrollWheel burst = {0};
+    hv_scroll_wheel_append(&burst, 0, 5 * 32 * 5, 1); // five coalesced notches at the user's 5x setting
+    int fast = 0, frames = 0;
+    while (hv_scroll_wheel_pending(&burst) && frames < 30) {
+        HvScrollWheelFrame f = hv_scroll_wheel_take(&burst, 1 + (++frames) / 60.0);
+        CHECK(f.x == 0 && f.y > 0 && f.y <= 256, "wheel is interpolated in bounded pixel steps");
+        if (frames == 1) CHECK(f.y < 800, "a burst is not posted as one jump");
+        fast += f.y;
+    }
+    CHECK(fast == 800 && !hv_scroll_wheel_pending(&burst), "fast five-notch burst retains its full distance");
+    HvScrollWheel isolated = {0};
+    int slow = 0;
+    for (int notch = 0; notch < 5; notch++) {
+        double now = 1 + notch * 0.25;
+        hv_scroll_wheel_append(&isolated, 0, 160, now);
+        for (int frame = 1; hv_scroll_wheel_pending(&isolated) && frame <= 15; frame++)
+            slow += hv_scroll_wheel_take(&isolated, now + frame / 60.0).y;
+    }
+    CHECK(slow == fast, "slow and fast wheel gestures have equal total travel");
+    hv_scroll_wheel_append(&burst, 0, 1280, 3);
+    CHECK(hv_scroll_wheel_take(&burst, 3.6).y == 0, "a severely stalled wheel queue expires rather than replaying late");
+    for (int i = 0; i < 4; i++) {
+        hv_scroll_wheel_append(&burst, 0.25, 0, 4 + i * 0.01);
+        CHECK(hv_scroll_wheel_take(&burst, 4 + i * 0.01).x == (i == 3 ? 1 : 0), "wheel fractions accumulate");
+    }
+    HvScrollLine parsed;
+    CHECK(hv_scroll_parse_line("41.000000 -9.000000 0.100000", &parsed) && parsed.kind == 'P' && parsed.x == 41,
+          "new helper accepts original v2 numeric messages");
+    CHECK(hv_scroll_parse_line("W 0 800 1.5", &parsed) && parsed.kind == 'W' && parsed.y == 800,
+          "typed wheel stream bypasses raw trackpad caps");
+    CHECK(!hv_scroll_parse_line("P 0 800 1.5", &parsed) && !hv_scroll_parse_line("W nan 2 0.3", &parsed) &&
+          !hv_scroll_parse_line("X 0 2 0.3", &parsed), "typed stream rejects invalid kind, range and nonfinite values");
+    printf("smooth wheel: fast/slow five-notch distance %d/%d pixels, %d frames; v2/v3 parsing passed\n", fast, slow, frames);
     printf("scroll pixels: replay totals at 0.1/0.3/1.5 = %d/%d/%d; gain, backpressure, idle and subpixel checks passed\n",
            totals[0], totals[1], totals[2]);
     return 0;

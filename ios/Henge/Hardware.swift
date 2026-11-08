@@ -370,7 +370,9 @@ final class HardwareMouse: ObservableObject {
         let (x, y) = state.motion.takeFrame()
         let horizontal = way * x, vertical = way * y
         guard horizontal != 0 || vertical != 0 else { return }
-        let helperReady = henge_vm_mouse_scroll_motion(Double(horizontal), Double(vertical), Double(scale)) != 0
+        let helperReady = (state.kind == .wheel
+            ? henge_vm_mouse_scroll_wheel(Double(horizontal), Double(vertical), Double(scale))
+            : henge_vm_mouse_scroll_motion(Double(horizontal), Double(vertical), Double(scale))) != 0
         if helperReady != state.helperReady {
             state.fallback = ScrollFallback()
             state.helperReady = helperReady

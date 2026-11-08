@@ -39,12 +39,14 @@ struct ScrollMotionTests {
             precondition(wheel.takeFrame() == (0, 32), "each isolated wheel unit gets useful pixel travel")
         }
         precondition(wheel.takeFrame() == (0, 0), "wheel does not leave a motion backlog")
+        for _ in 0..<5 { wheel.append(x: 0, y: 1) }
+        precondition(wheel.takeFrame() == (0, 160), "five fast notches travel as far as five isolated notches")
         wheel.append(x: -0.125, y: 0)
         precondition(wheel.takeFrame() == (-4, 0), "fractional horizontal wheel units retain direction and precision")
         wheel.append(x: .nan, y: .infinity)
         precondition(wheel.takeFrame() == (0, 0), "invalid wheel values are ignored")
         wheel.append(x: 0, y: -1000000)
-        precondition(wheel.takeFrame() == (0, -32), "fast wheel input remains bounded before gain")
+        precondition(wheel.takeFrame() == (0, -256), "extreme wheel input is bounded to eight notches before gain")
         motion = ScrollMotion()
         motion.append(x: 0, y: 1)
         wheel.append(x: 0, y: 1)

@@ -9,6 +9,7 @@
 #include <sys/time.h>
 #include <unistd.h>
 #include "scroll_pixels.h"
+#include "scroll_wheel.h"
 
 #define HOST "10.0.2.4"
 static int send_all(int fd, const void *p, size_t n);
@@ -27,6 +28,11 @@ static double reportRawX, reportRawY, reportScale = 0.3, reportDelay;
 static long long reportX, reportY, reportPointX, reportPointY;
 static unsigned reportFrames, reportDropped;
 static CFAbsoluteTime reportStarted;
+static char reportKind = 'P';
+static HvScrollWheel wheelMotion;
+static double wheelReceivedX, wheelReceivedY, wheelScale = 0.3;
+static BOOL wheelScheduled;
+static CFAbsoluteTime lastWheelPost;
 
 static void postPixels(int x, int y, int phase) {
     /* Pixel units bypass the mouse driver's wheel acceleration. */
@@ -46,9 +52,9 @@ static void postPixels(int x, int y, int phase) {
 static void reportScroll(CFAbsoluteTime now, BOOL force) {
     if (!reportStarted) reportStarted = now;
     if ((!force && now - reportStarted < 1) || (!reportFrames && !reportDropped)) return;
-    NSString *text = [NSString stringWithFormat:@"%.6f %.3f %.3f %lld %lld %lld %lld %u %.3f %u",
+    NSString *text = [NSString stringWithFormat:@"%.6f %.3f %.3f %lld %lld %lld %lld %u %.3f %u %c",
                       reportScale, reportRawX, reportRawY, reportX, reportY, reportPointX, reportPointY,
-                      reportFrames, reportDelay, reportDropped];
+                      reportFrames, reportDelay, reportDropped, reportKind];
     NSData *body = [text dataUsingEncoding:NSUTF8StringEncoding];
     reportRawX = reportRawY = reportDelay = 0;
     reportX = reportY = reportPointX = reportPointY = 0;
@@ -58,6 +64,57 @@ static void reportScroll(CFAbsoluteTime now, BOOL force) {
         int status = 0;
         request(@"POST", @"/.henge/scroll-report", body, &status, NULL);
     });
+}
+
+static void selectScrollReport(char kind, double scale, CFAbsoluteTime now) {
+    if ((reportFrames || reportDropped) && (reportKind != kind || reportScale != scale)) reportScroll(now, YES);
+    reportKind = kind;
+    reportScale = scale;
+}
+
+static void deliverWheel(void) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    [scrollLock lock];
+    HvScrollWheelFrame frame = hv_scroll_wheel_take(&wheelMotion, now);
+    double receivedX = wheelReceivedX, receivedY = wheelReceivedY, gain = wheelScale;
+    double delay = MAX(0, now - wheelMotion.last_input) * 1000;
+    wheelReceivedX = wheelReceivedY = 0;
+    BOOL more = hv_scroll_wheel_pending(&wheelMotion);
+    wheelScheduled = more;
+    [scrollLock unlock];
+    selectScrollReport('W', gain, now);
+    reportRawX += receivedX;
+    reportRawY += receivedY;
+    if (frame.x || frame.y) {
+        reportFrames++;
+        reportDelay = MAX(reportDelay, delay);
+        reportX += frame.x;
+        reportY += frame.y;
+        postPixels(frame.x, frame.y, now - lastWheelPost > 0.12 ? 1 : 2);
+        lastWheelPost = now;
+        unsigned long generation = ++scrollGeneration;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_MSEC), scrollDeliveryQueue, ^{
+            if (scrollGeneration == generation) {
+                postPixels(0, 0, 4);
+                reportScroll(CFAbsoluteTimeGetCurrent(), YES);
+            }
+        });
+    }
+    reportScroll(now, NO);
+    if (more) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 60), scrollDeliveryQueue, ^{ deliverWheel(); });
+}
+
+static void queueWheel(double x, double y, double scale) {
+    if (!x && !y) return;
+    [scrollLock lock];
+    hv_scroll_wheel_append(&wheelMotion, x, y, CFAbsoluteTimeGetCurrent());
+    wheelReceivedX += x;
+    wheelReceivedY += y;
+    wheelScale = scale;
+    BOOL schedule = !wheelScheduled && hv_scroll_wheel_pending(&wheelMotion);
+    if (schedule) wheelScheduled = YES;
+    [scrollLock unlock];
+    if (schedule) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 60), scrollDeliveryQueue, ^{ deliverWheel(); });
 }
 
 static void queueMotion(double x, double y, double scale) {
@@ -80,6 +137,7 @@ static void queueMotion(double x, double y, double scale) {
         scrollScheduled = NO;
         [scrollLock unlock];
         CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        selectScrollReport('P', gain, now);
         if (now - latest > 0.1) {
             reportDropped++;
             pixelMapper = (HvScrollPixelMapper){0};
@@ -87,8 +145,6 @@ static void queueMotion(double x, double y, double scale) {
             reportScroll(now, YES);
             return;
         }
-        if (reportFrames && reportScale != gain) reportScroll(now, YES);
-        reportScale = gain;
         BOOL began = now - lastScrollTime > 0.12;
         if (now - lastMotionTime > 0.12) pixelMapper = (HvScrollPixelMapper){0};
         lastMotionTime = now;
@@ -125,7 +181,7 @@ static void followScroll(void) {
             setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof on);
             struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(80)};
             inet_pton(AF_INET, HOST, &addr.sin_addr);
-            static const char head[] = "GET /.henge/scroll-v2 HTTP/1.1\r\nHost: " HOST "\r\nConnection: close\r\n\r\n";
+            static const char head[] = "GET /.henge/scroll-v2?wheel=1 HTTP/1.1\r\nHost: " HOST "\r\nConnection: close\r\n\r\n";
             if (connect(fd, (struct sockaddr *)&addr, sizeof addr) == 0 && send_all(fd, head, sizeof head - 1) == 0) {
                 NSMutableData *pending = [NSMutableData data];
                 BOOL headers = YES;
@@ -151,10 +207,11 @@ static void followScroll(void) {
                         NSRange end = [pending rangeOfData:[NSData dataWithBytes:"\n" length:1] options:0 range:NSMakeRange(0, pending.length)];
                         if (end.location == NSNotFound) break;
                         NSString *line = [[NSString alloc] initWithData:[pending subdataWithRange:NSMakeRange(0, end.location)] encoding:NSUTF8StringEncoding];
-                        double x = 0, y = 0, scale = 0;
-                        if (line && sscanf(line.UTF8String, "%lf %lf %lf", &x, &y, &scale) == 3 && isfinite(x) && isfinite(y) &&
-                            isfinite(scale) && x >= -64 && x <= 64 && y >= -64 && y <= 64 && scale >= 0.1 && scale <= 1.5)
-                            queueMotion(x, y, scale);
+                        HvScrollLine motion;
+                        if (line && hv_scroll_parse_line(line.UTF8String, &motion)) {
+                            if (motion.kind == 'W') queueWheel(motion.x, motion.y, motion.scale); // gain already applied by the host
+                            else queueMotion(motion.x, motion.y, motion.scale);
+                        }
                         [pending replaceBytesInRange:NSMakeRange(0, NSMaxRange(end)) withBytes:NULL length:0];
                     }
                 }
@@ -162,6 +219,8 @@ static void followScroll(void) {
             close(fd);
             [scrollLock lock];
             pendingScrollX = pendingScrollY = 0;
+            wheelMotion = (HvScrollWheel){0};
+            wheelReceivedX = wheelReceivedY = 0;
             [scrollLock unlock];
             sleep(1);
         }
