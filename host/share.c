@@ -813,16 +813,19 @@ static int serve_native_image(Conn *c, Request *r, int capability) {
     }
     r->close = 1; /* binary upload/response: never reinterpret leftover body bytes as another request */
     if (capability || strcmp(r->method, "POST")) return respond_empty(c, r, 405, "Method Not Allowed");
-    int extension, pad, analyze, end = 0;
-    if (sscanf(r->query, "extension=%d&pad=%d&analyze=%d%n", &extension, &pad, &analyze, &end) != 3
-        || r->query[end] || extension < 0 || extension > 1 || pad < 0 || pad > 1 || analyze < 0 || analyze > 1)
-        return respond_empty(c, r, 400, "Bad Request");
+    int flags = -1;
+    for (int i = 0; i < 8; i++) {
+        char query[48];
+        snprintf(query, sizeof query, "extension=%d&pad=%d&analyze=%d", i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        if (!strcmp(query, r->query)) flags = i;
+    }
+    if (flags < 0) return respond_empty(c, r, 400, "Bad Request");
     if (r->length < 0 || (unsigned long long)r->length > HV_IMAGE_INPUT_MAX) return respond_empty(c, r, 413, "Too Large");
     if (pthread_mutex_trylock(&image_mu) != 0) return respond_empty(c, r, 429, "Busy");
     size_t length = 0, out_length = 0;
     uint8_t *out = NULL;
     char *body = body_limited(c, r, &length, HV_IMAGE_INPUT_MAX);
-    int status = body && length ? process((const uint8_t *)body, length, extension, pad, analyze, &out, &out_length) : 413;
+    int status = body && length ? process((const uint8_t *)body, length, flags & 1, (flags >> 1) & 1, (flags >> 2) & 1, &out, &out_length) : 413;
     free(body);
     if (status == 200 && (!out || out_length < 4 || out_length > HV_IMAGE_OUTPUT_MAX)) status = 500;
     int result = respond(c, r, status, status == 200 ? "OK" : "Image Processing Failed",

@@ -1,6 +1,10 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <ImageIO/ImageIO.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>
+#endif
 #include <pthread/qos.h>
 #include <stdlib.h>
 #include <string.h>
@@ -49,6 +53,10 @@ int hv_native_image_process(const uint8_t *input, size_t bytes, int extension, i
         size_t w = orientation >= 5 && orientation <= 8 ? raw_h : raw_w;
         size_t h = orientation >= 5 && orientation <= 8 ? raw_w : raw_h;
         if (!hv_image_dimensions(w, h)) { CFRelease(source); return 413; }
+#if TARGET_OS_IPHONE
+        /* Keep decoder/context/PNG scratch out of the app's remaining jetsam headroom. */
+        if (os_proc_available_memory() < w * h * 24ull + bytes * 2ull + (64ull << 20)) { CFRelease(source); return 429; }
+#endif
         BOOL is_png = input[0] == 137 && bytes >= 8 && !memcmp(input, "\x89PNG\r\n\x1a\n", 8);
         size_t target_w = w, target_h = h;
         if (!analyze_only && extension && hv_image_fixed(w, h) != 2 && (w > 3000 || h > 3000)) {
@@ -86,7 +94,7 @@ int hv_native_image_process(const uint8_t *input, size_t bytes, int extension, i
         int status = 200;
         if (!analyze_only && (plan.fixed || extension) && (normalized || !is_png || orientation > 1)) {
             CGImageRef image = CGBitmapContextCreateImage(base);
-            original = png_image(image); CGImageRelease(image);
+            original = png_image(image); if (image) CGImageRelease(image);
             if (!original) status = 500;
         }
         if (!analyze_only && plan.fixed) {
@@ -124,7 +132,7 @@ int hv_native_image_process(const uint8_t *input, size_t bytes, int extension, i
             meta[@"analysis"] = analysis(final, fa);
             if (!analyze_only && !passthrough) {
                 CGImageRef image = CGBitmapContextCreateImage(final);
-                result_png = png_image(image); CGImageRelease(image);
+                result_png = png_image(image); if (image) CGImageRelease(image);
                 if (!result_png) status = 500;
             }
         }
