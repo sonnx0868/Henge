@@ -41,9 +41,10 @@ struct SettingsView: View {
                         }
                         Toggle("Reverse scrolling", isOn: $reverseScrolling)
                         VStack(alignment: .leading, spacing: 4) {
-                            Text("Scroll speed")
+                            Text("Trackpad speed")
                             Slider(value: $scrollSpeed, in: 0.1...1.5)
                         }
+                        MouseScrollSettings()
                         Text("A Magic Keyboard or a Bluetooth mouse moves the Mac's pointer. Pointer speed changes apply the next time a Mac starts; scroll speed changes apply immediately.")
                             .font(.footnote).foregroundStyle(.secondary)
                     }

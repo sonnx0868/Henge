@@ -115,11 +115,32 @@ enum PointerLock {
 
 /// A Magic Keyboard's trackpad or a mouse, while a Mac is running. GameController gives the raw motion,
 /// which macOS then accelerates as it would for its own mouse.
-final class HardwareMouse {
+final class HardwareMouse: ObservableObject {
     static let shared = HardwareMouse()
     static let speedKey = "henge.mouse.speed"
     static let reverseKey = "henge.mouse.reverse"
     static let scrollSpeedKey = "henge.mouse.scrollSpeed"
+    static let wheelSpeedKey = "henge.mouse.wheelSpeed"
+
+    struct ScrollDevice: Identifiable {
+        let id: ObjectIdentifier
+        let name: String
+        let profileKey: String
+    }
+    @Published private(set) var scrollDevices: [ScrollDevice] = []
+
+    private final class ScrollState {
+        var kind: ScrollInputKind
+        var motion: ScrollMotion
+        var flush: DispatchWorkItem?
+        var lastTime: TimeInterval = 0, lastWheelTime: TimeInterval = 0
+        var fallbackX: Float = 0, fallbackY: Float = 0
+        var rawLogs = 0, frameLogs = 0
+        init(kind: ScrollInputKind) { self.kind = kind; motion = ScrollMotion(kind: kind) }
+        deinit { flush?.cancel() }
+    }
+    private var scrollStates: [ObjectIdentifier: ScrollState] = [:]
+    private var inputEpoch: UInt64 = 0
 
     private var observers: [NSObjectProtocol] = []
     private var mice: [GCMouse] = []
@@ -127,12 +148,6 @@ final class HardwareMouse {
     private var restX: Float = 0, restY: Float = 0
     private var speed: Float = 1
     private var reverse = false
-    private var scrollsLogged = 0 // the first few, to see what a device's raw values look like
-    private var scrollMotion = ScrollMotion()
-    private var scrollFlush: DispatchWorkItem?
-    private var lastScrollTime: TimeInterval = 0, lastWheelTime: TimeInterval = 0
-    private var fallbackX: Float = 0, fallbackY: Float = 0
-    private var scrollFramesLogged = 0
     private var scrollDiagnostics = false
     private var running = false
     private var secondaryClick = SecondaryClickRouting()
@@ -140,17 +155,12 @@ final class HardwareMouse {
     private var uiKitButtonLogs = 0
 
     func start() {
+        guard !running else { return }
         running = true
+        inputEpoch &+= 1
         let defaults = UserDefaults.standard
         speed = defaults.object(forKey: Self.speedKey) == nil ? 1 : Float(defaults.double(forKey: Self.speedKey))
         reverse = defaults.bool(forKey: Self.reverseKey)
-        scrollFlush?.cancel()
-        scrollFlush = nil
-        scrollMotion = ScrollMotion()
-        lastScrollTime = 0
-        lastWheelTime = 0
-        fallbackX = 0
-        fallbackY = 0
         scrollDiagnostics = defaults.bool(forKey: "henge.performanceDiagnostics")
         secondaryClick.reset()
         buttonLogs = [0, 0, 0]
@@ -162,6 +172,9 @@ final class HardwareMouse {
         observers.append(NotificationCenter.default.addObserver(forName: .GCMouseDidDisconnect, object: nil, queue: .main) { [weak self] note in
             guard let self, let mouse = note.object as? GCMouse else { return }
             self.releaseButtons()
+            let id = ObjectIdentifier(mouse)
+            self.scrollStates.removeValue(forKey: id)?.flush?.cancel()
+            self.scrollDevices.removeAll { $0.id == id }
             self.mice.removeAll { $0 === mouse }
         })
         observers.append(NotificationCenter.default.addObserver(forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { note in
@@ -173,9 +186,10 @@ final class HardwareMouse {
 
     func stop() {
         running = false
-        scrollFlush?.cancel()
-        scrollFlush = nil
-        scrollMotion = ScrollMotion()
+        inputEpoch &+= 1
+        for state in scrollStates.values { state.flush?.cancel() }
+        scrollStates.removeAll()
+        scrollDevices.removeAll()
         PointerLock.set(false)
         releaseButtons()
         observers.forEach(NotificationCenter.default.removeObserver)
@@ -204,6 +218,11 @@ final class HardwareMouse {
         mice.append(mouse)
         HengeLog.log("input", "mouse: \(mouse.vendorName ?? "?"), right button \(input.rightButton != nil), middle \(input.middleButton != nil)")
         let name = mouse.vendorName ?? "?"
+        let id = ObjectIdentifier(mouse), epoch = inputEpoch
+        let profileKey = "henge.mouse.scrollKind." + Data(name.utf8).base64EncodedString()
+        let device = ScrollDevice(id: id, name: name == "?" ? "Unnamed pointing device" : name, profileKey: profileKey)
+        scrollDevices.append(device)
+        scrollStates[id] = ScrollState(kind: scrollKind(for: device))
         input.mouseMovedHandler = { [weak self] _, dx, dy in self?.moved(dx, dy) }
         input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
             DispatchQueue.main.async { self?.button(0, pressed, device: name) }
@@ -218,10 +237,10 @@ final class HardwareMouse {
         // Each axis reports its own relative events. Comparing values to the
         // previous callback drops legitimate identical deltas during steady motion.
         input.scroll.xAxis.valueChangedHandler = { [weak self] _, value in
-            DispatchQueue.main.async { self?.scrolled(horizontal: 0, vertical: -value) }
+            DispatchQueue.main.async { self?.scrolled(horizontal: 0, vertical: -value, device: device, epoch: epoch) }
         }
         input.scroll.yAxis.valueChangedHandler = { [weak self] _, value in
-            DispatchQueue.main.async { self?.scrolled(horizontal: value, vertical: 0) }
+            DispatchQueue.main.async { self?.scrolled(horizontal: value, vertical: 0, device: device, epoch: epoch) }
         }
     }
 
@@ -274,65 +293,84 @@ final class HardwareMouse {
         }
     }
 
-    /// Coalesce high-resolution pad callbacks before delivering a display frame.
-    private func scrolled(horizontal: Float, vertical: Float) {
-        guard running else { return }
+    func scrollKind(for device: ScrollDevice) -> ScrollInputKind {
+        UserDefaults.standard.string(forKey: device.profileKey).flatMap(ScrollInputKind.init(rawValue:)) ?? .precision
+    }
+
+    func setScrollKind(_ kind: ScrollInputKind, for device: ScrollDevice) {
+        objectWillChange.send()
+        UserDefaults.standard.set(kind.rawValue, forKey: device.profileKey)
+        for item in scrollDevices where item.profileKey == device.profileKey {
+            scrollStates[item.id]?.flush?.cancel()
+            scrollStates[item.id] = ScrollState(kind: kind)
+        }
+        HengeLog.log("input", "scroll profile: \(device.name) = \(kind.rawValue)")
+    }
+
+    /// Each physical device owns its pending frame, gain and fallback state.
+    private func scrolled(horizontal: Float, vertical: Float, device: ScrollDevice, epoch: UInt64) {
+        guard running, epoch == inputEpoch, let state = scrollStates[device.id] else { return }
         guard horizontal != 0 || vertical != 0 else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        if now - lastScrollTime > 0.12 {
-            scrollMotion = ScrollMotion()
-            fallbackX = 0
-            fallbackY = 0
-            scrollsLogged = 0
-            scrollFramesLogged = 0
+        if now - state.lastTime > 0.12 {
+            state.motion = ScrollMotion(kind: state.kind)
+            state.fallbackX = 0
+            state.fallbackY = 0
+            state.rawLogs = 0
+            state.frameLogs = 0
         }
-        lastScrollTime = now
-        scrollMotion.append(x: horizontal, y: vertical)
-        if scrollDiagnostics && scrollsLogged < 24 {
-            scrollsLogged += 1
-            HengeLog.log("input", "scroll raw axes: \(horizontal), \(vertical); coalesced for pixel delivery")
+        state.lastTime = now
+        state.motion.append(x: horizontal, y: vertical)
+        if scrollDiagnostics && state.rawLogs < 24 {
+            state.rawLogs += 1
+            HengeLog.log("input", "scroll raw axes: \(horizontal), \(vertical); device \(device.name); kind \(state.kind.rawValue)")
         }
-        guard scrollFlush == nil else { return }
-        let work = DispatchWorkItem { [weak self] in self?.flushScroll() }
-        scrollFlush = work
+        guard state.flush == nil else { return }
+        let work = DispatchWorkItem { [weak self, weak state] in
+            guard let self, let state, self.scrollStates[device.id] === state, self.inputEpoch == epoch else { return }
+            self.flushScroll(state, device: device)
+        }
+        state.flush = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0 / 60, execute: work)
     }
 
-    private func flushScroll() {
-        scrollFlush = nil
+    private func flushScroll(_ state: ScrollState, device: ScrollDevice) {
+        state.flush = nil
         guard running else { return }
         let defaults = UserDefaults.standard
-        let configured = defaults.object(forKey: Self.scrollSpeedKey) == nil
-            ? 0.3 : defaults.double(forKey: Self.scrollSpeedKey)
+        let key = state.kind == .wheel ? Self.wheelSpeedKey : Self.scrollSpeedKey
+        let configured = defaults.object(forKey: key) == nil ? 0.3 : defaults.double(forKey: key)
         let scale = Float(configured.isFinite ? min(max(configured, 0.1), 1.5) : 0.3)
         let way: Float = reverse ? -1 : 1
-        let (x, y) = scrollMotion.takeFrame()
+        let (x, y) = state.motion.takeFrame()
         let horizontal = way * x, vertical = way * y
         guard horizontal != 0 || vertical != 0 else { return }
         if henge_vm_mouse_scroll_motion(Double(horizontal), Double(vertical), Double(scale)) != 0 {
-            fallbackX = 0
-            fallbackY = 0
-            if scrollDiagnostics && scrollFramesLogged < 24 {
-                scrollFramesLogged += 1
-                HengeLog.log("input", "scroll frame raw: \(horizontal), \(vertical); scale \(scale); protocol v2")
+            state.fallbackX = 0
+            state.fallbackY = 0
+            if scrollDiagnostics && state.frameLogs < 24 {
+                state.frameLogs += 1
+                HengeLog.log("input", "scroll frame raw: \(horizontal), \(vertical); scale \(scale); device \(device.name); kind \(state.kind.rawValue); protocol v2")
             }
             return
         }
         // Until the helper is ready, never feed a high-rate pad into the guest's
         // accelerated coarse wheel: at most one notch per axis every 50 ms.
-        fallbackX = min(max(fallbackX + horizontal * (scale / 0.3), -8), 8)
-        fallbackY = min(max(fallbackY + vertical * (scale / 0.3), -8), 8)
+        // Convert wheel pixels back to raw wheel units for the discrete fallback.
+        let unit: Float = state.kind == .wheel ? 8 : 1
+        state.fallbackX = min(max(state.fallbackX + horizontal / unit * (scale / 0.3), -8), 8)
+        state.fallbackY = min(max(state.fallbackY + vertical / unit * (scale / 0.3), -8), 8)
         let now = ProcessInfo.processInfo.systemUptime
-        guard now - lastWheelTime >= 0.05 else { return }
-        let dx: Int32 = abs(fallbackX) >= 4 ? (fallbackX < 0 ? -1 : 1) : 0
-        let dy: Int32 = abs(fallbackY) >= 4 ? (fallbackY < 0 ? -1 : 1) : 0
+        guard now - state.lastWheelTime >= 0.05 else { return }
+        let dx: Int32 = abs(state.fallbackX) >= 4 ? (state.fallbackX < 0 ? -1 : 1) : 0
+        let dy: Int32 = abs(state.fallbackY) >= 4 ? (state.fallbackY < 0 ? -1 : 1) : 0
         guard dx != 0 || dy != 0 else { return }
-        fallbackX -= Float(dx) * 4
-        fallbackY -= Float(dy) * 4
-        lastWheelTime = now
+        state.fallbackX -= Float(dx) * 4
+        state.fallbackY -= Float(dy) * 4
+        state.lastWheelTime = now
         henge_vm_mouse_scroll(dx, dy)
-        if scrollDiagnostics && scrollFramesLogged < 24 {
-            scrollFramesLogged += 1
+        if scrollDiagnostics && state.frameLogs < 24 {
+            state.frameLogs += 1
             HengeLog.log("input", "scroll frame wheel fallback: \(dx), \(dy); scale \(scale)")
         }
     }

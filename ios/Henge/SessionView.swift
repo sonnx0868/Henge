@@ -389,8 +389,9 @@ struct SessionView: View {
                     }
                     .pickerStyle(.segmented)
                     Toggle("Sharp edges", isOn: $sharpCursor)
-                    LabeledContent("Scroll speed", value: String(format: "%.1f×", scrollSpeed))
+                    LabeledContent("Trackpad speed", value: String(format: "%.1f×", scrollSpeed))
                     Slider(value: $scrollSpeed, in: 0.1...1.5)
+                    MouseScrollSettings()
                     LabeledContent("Smooth trackpad scrolling", value: pixelScrollReady ? "On" : "Needs Mac helper")
                     if !pixelScrollReady {
                         Text("Use the setup command in Sharing below, then allow henge-agent in macOS System Settings → Privacy & Security → Accessibility. Until then, scrolling uses a limited mouse wheel fallback.")

@@ -30,6 +30,10 @@ int main(void) {
     for (int i = 0; i < 4; i++) pixels += hv_scroll_pixels_apply(&fine, 0, 0.75, 0.1).y;
     CHECK(pixels == 1, "small motion survives fractional pixel accumulation");
     CHECK(hv_scroll_pixels_apply(&fine, NAN, INFINITY, 0.1).x == 0, "invalid raw values are ignored");
+    HvScrollPixelMapper wheel = {0};
+    for (int i = 0; i < 5; i++)
+        CHECK(hv_scroll_pixels_apply(&wheel, 0, 32, 0.3).y == 32, "converted isolated wheel unit survives guest delivery");
+    CHECK(hv_scroll_pixels_apply(&wheel, -4, 0, 0.3).x == -4, "fractional horizontal wheel conversion survives guest delivery");
     printf("scroll pixels: replay totals at 0.1/0.3/1.5 = %d/%d/%d; gain, backpressure, idle and subpixel checks passed\n",
            totals[0], totals[1], totals[2]);
     return 0;

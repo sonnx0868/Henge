@@ -33,6 +33,24 @@ struct ScrollMotionTests {
         precondition(motion.takeFrame() == (0, 8), "identical relative deltas must both count")
         motion.append(x: 1, y: 8)
         precondition(motion.takeFrame() == (0, 8), "vertical gestures suppress sideways noise")
+        var wheel = ScrollMotion(kind: .wheel)
+        for _ in 0..<5 {
+            wheel.append(x: 0, y: 1)
+            precondition(wheel.takeFrame() == (0, 32), "each isolated wheel unit gets useful pixel travel")
+        }
+        precondition(wheel.takeFrame() == (0, 0), "wheel does not leave a motion backlog")
+        wheel.append(x: -0.125, y: 0)
+        precondition(wheel.takeFrame() == (-4, 0), "fractional horizontal wheel units retain direction and precision")
+        wheel.append(x: .nan, y: .infinity)
+        precondition(wheel.takeFrame() == (0, 0), "invalid wheel values are ignored")
+        wheel.append(x: 0, y: -1000000)
+        precondition(wheel.takeFrame() == (0, -32), "fast wheel input remains bounded before gain")
+        motion = ScrollMotion()
+        motion.append(x: 0, y: 1)
+        wheel.append(x: 0, y: 1)
+        precondition(motion.takeFrame() == (0, 1) && wheel.takeFrame() == (0, 32),
+                     "separate device accumulators preserve the existing pad conversion")
         print("scroll motion: recorded gesture, frame limits, idle, direction, spikes and subpixel checks passed")
+        print("wheel motion: five isolated units, fractional horizontal input, invalid values and independent pad state passed")
     }
 }
