@@ -151,7 +151,10 @@ enum { OBJ_BUFFER = 1, OBJ_TEXTURE = 2, OBJ_FUNCTION = 6, OBJ_SERIALIZED = 7, OB
     _Atomic int stopping;
     dispatch_group_t completions;
     id<MTLCommandBuffer> last_cb;
-    double encode_time, gpu_wait_time;
+    double encode_time, commit_time;
+    /* What the GPU spent on the guest's work, counting time that buffers overlap once. gpu_last_end: completion handlers only. */
+    _Atomic uint64_t gpu_busy_ns;
+    double gpu_last_end;
     uint64_t resource_sync_exec, video_deduplicated, video_uploads, video_skips, video_fences, video_copy_failures;
     double video_wait_time;
     _Atomic uint64_t gpu_redraws;
@@ -2077,6 +2080,11 @@ typedef struct {
     atomic_fetch_add(&inflight, 1);
     dispatch_group_enter(completions);
     [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        CFTimeInterval from = MAX(done.GPUStartTime, self->gpu_last_end), to = done.GPUEndTime;
+        if (to > from) {
+            atomic_fetch_add(&self->gpu_busy_ns, (uint64_t)((to - from) * 1e9));
+            self->gpu_last_end = to;
+        }
         if (done.error) {
             self->failed++;
             fprintf(stderr, "hengevm: pvg-metal: command buffer: %s\n", done.error.localizedDescription.UTF8String);
@@ -2229,12 +2237,12 @@ typedef struct {
     double t1 = now_seconds();
     [self commit:cb channel:ch stamp:stamp complete:YES redraw:writes_visible];
     double t2 = now_seconds();
-    encode_time += t1 - t_begin, gpu_wait_time += t2 - t1;
+    encode_time += t1 - t_begin, commit_time += t2 - t1;
     if (++execs % 2000 == 0) {
         static double t0;
         if (!t0) t0 = now_seconds();
-        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, waiting for the GPU %.2f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, gpu_wait_time);
-        encode_time = gpu_wait_time = 0;
+        fprintf(stderr, "hengevm: pvg-metal: %llu execs, %llu draws, %llu failed, %llu synced, %llu remaps, %.0f s; encoding %.2f s, committing %.2f s, GPU busy %.2f s\n", (unsigned long long)execs, (unsigned long long)draws, (unsigned long long)failed, (unsigned long long)synced, (unsigned long long)remaps, now_seconds() - t0, encode_time, commit_time, (double)atomic_exchange(&gpu_busy_ns, 0) * 1e-9);
+        encode_time = commit_time = 0;
     }
     return YES;
 }
