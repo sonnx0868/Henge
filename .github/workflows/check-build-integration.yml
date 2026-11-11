@@ -1,0 +1,43 @@
+name: Verify and build Henge integration
+
+on:
+  push:
+    branches: [codex/integrate-henge-0-3]
+    paths-ignore: ['**.md']
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: henge-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      BITRISE_SOURCE_DIR: ${{ github.workspace }}/Henge
+      BITRISE_DEPLOY_DIR: ${{ github.workspace }}/artifacts
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: Henge
+      - name: Verify integration and package IPA
+        working-directory: Henge
+        run: bash ci/build-bitrise.sh
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Henge-0.3.1-build103-${{ github.sha }}
+          path: artifacts/Henge-color-fix-unsigned.zip
+          if-no-files-found: error
+      - name: Upload compiler logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: henge-build-logs
+          path: Henge/ios/build/*.buildlog
+          if-no-files-found: ignore
