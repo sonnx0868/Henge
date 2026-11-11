@@ -22,31 +22,49 @@ double henge_install_progress(void);
 /* Writes a blank auxiliary storage file (what VZMacAuxiliaryStorage makes). 0 or -1. */
 int henge_make_aux(const char *path);
 
-/* 0 not started, 1 running, 2 stopped. */
+/* 0 not started, 1 running, 2 stopped, 3 starting/stopping.
+   Normal guests are fully released before state 2; installer sessions retain
+   their restore stack and can_start stays false. */
 int henge_vm_state(void);
-/* Why it stopped (an HV_EXIT_* name), once state is 2. */
+/* A new generation starts with each successful boot, even in the same view. */
+uint64_t henge_vm_generation(void);
+int henge_vm_can_start(void);
+/* Human-readable terminal reason, once state is 2. */
 const char *henge_vm_exit_reason(void);
+/* Terminal outcome after state == 2. Generic HALT alone does not prove a
+   guest shutdown (it also covers reset, host stop and guest panic). */
+enum HengeVmOutcome {
+    HENGE_VM_OUTCOME_ERROR, HENGE_VM_OUTCOME_SHUTDOWN, HENGE_VM_OUTCOME_RESTART,
+    HENGE_VM_OUTCOME_HOST_STOP, HENGE_VM_OUTCOME_PANIC
+};
+int henge_vm_exit_outcome(void);
 void henge_vm_stop(void);
-/* Enable 15-second CPU/JIT and network queue diagnostics for the next boot. */
-void henge_vm_set_diagnostics(int enabled);
 /* Testing: sets a translation knob (core/machine.h) in the running machine; nonzero if it exists. */
 int henge_vm_knob(const char *name, int value);
+/* The memory balloon (only with HV_BALLOON set before boot): asks the guest to hand over target_mb (when >= 0)
+   and returns how many MB it has handed over, or -1 without a balloon. */
+long henge_vm_balloon(long target_mb);
 
 /* Progress, for the session screen. */
 uint64_t henge_vm_blocks(void);            /* blocks the CPUs entered */
 uint64_t henge_vm_net_frames(int sent);    /* Ethernet frames out (sent = 1) and in */
-uint64_t henge_vm_audio_underruns(void);
-uint64_t henge_vm_audio_queued_bytes(void);
+uint64_t henge_vm_dns(int which);          /* guest DNS queries answered through iOS's resolver (0), handed to libslirp (1), unanswered in time (2) */
 int henge_vm_cpus_on(void);                /* CPUs the guest has started */
-/* Which allocation actually succeeded, rather than the requested setting. Static string. */
-const char *henge_vm_ram_backing(void);
 int henge_vm_guest_el0(void);              /* any CPU running user code right now */
 
 /* Input: Linux key codes, relative pointer, buttons 0 left 1 right 2 middle. */
 /* The shared folder and clipboard (host/share.c). henge_vm_share goes before henge_vm_boot; agent may be NULL.
    henge_share_take_clipboard returns what the guest copied, once: a malloc'd string, or NULL. */
-void henge_vm_share(const char *folder, const char *socket_path, const char *agent);
+void henge_vm_set_diagnostics(int enabled);
 void henge_vm_set_native_images(int enabled);
+const char *henge_vm_ram_backing(void);
+uint64_t henge_vm_audio_underruns(void);
+uint64_t henge_vm_audio_queued_bytes(void);
+int henge_vm_mouse_scroll_motion(double dx, double dy, double scale);
+int henge_vm_mouse_scroll_wheel(double dx, double dy, double scale);
+int henge_vm_pixel_wheel_ready(void);
+int henge_vm_pixel_scroll_ready(void);
+void henge_vm_share(const char *folder, const char *socket_path, const char *agent);
 void henge_share_set_clipboard(const char *text);
 char *henge_share_take_clipboard(void);
 long henge_share_agent_seen(void);
@@ -61,22 +79,26 @@ void henge_vm_mouse_move(int dx, int dy);
 void henge_vm_mouse_button(int button, int down);
 /* Wheel units: dy > 0 up, dx > 0 right. */
 void henge_vm_mouse_scroll(int dx, int dy);
-int henge_vm_mouse_scroll_motion(double dx, double dy, double scale);
-int henge_vm_mouse_scroll_wheel(double dx, double dy, double scale);
-int henge_vm_pixel_wheel_ready(void);
-int henge_vm_pixel_scroll_ready(void);
+/* The Magic Trackpad 2 the Mac sees on its USB bus: a finger on it. phase: 0 down, 1 move, 2 up;
+   finger a stable 1..15 per touch; x, y sensor units 0..8134, 0..5206. ts_ms is the touch
+   sample's own clock in ms, so the guest computes finger speed from real sample timing. */
+void henge_vm_touch(int finger, int phase, int x, int y, uint32_t ts_ms);
+void henge_vm_touch_frame(uint32_t ts_ms); /* commit one frame with every finger that moved */
+void henge_vm_touch_button(int down); /* the pad's full press (a click) */
 /* Where the guest has its pointer, in display pixels. 0, or -1 before it has one. */
 int henge_vm_pointer(int *x, int *y);
 /* A small picture of the display, BGRA, width * height * 4 bytes. 0, or -1 before anything shows. */
 int henge_vm_snapshot(uint8_t *bgra, int width, int height);
 
 /* The boot framebuffer (Apple logo and progress bar), 32-bit BGRA, or -1 if
-   the kernel has not got that far. The pixels are the guest's live memory. */
+   the kernel has not got that far. A successful call returns an owned copy;
+   release it with henge_vm_free_display after use. */
 /// Where the Mac's GPU frames go: a CAMetalLayer. Keep it alive while the machine runs.
 void henge_vm_set_display_layer(void *layer);
 /// How many frames have gone to it.
 uint64_t henge_vm_gpu_frames(void);
 int henge_vm_boot_display(const uint8_t **pixels, int *width, int *height, int *stride);
+void henge_vm_free_display(const uint8_t *pixels);
 
 /* The largest single mapping the address space takes right now, in MB (the
    increased virtual addressing entitlement raises it). */

@@ -188,7 +188,7 @@ final class HardwareMouse: ObservableObject {
 
     private var observers: [NSObjectProtocol] = []
     private var mice: [GCMouse] = []
-    private var buttonsDown: Set<Int32> = []
+    private var buttons = PhysicalMouseButtons(swapsRightAndMiddle: false)
     private var restX: Float = 0, restY: Float = 0
     private var speed: Float = 1
     private var reverse = false
@@ -211,6 +211,7 @@ final class HardwareMouse: ObservableObject {
         recentScrollSamples.removeAll(keepingCapacity: true)
         recentButtonSamples.removeAll(keepingCapacity: true)
         secondaryClick.reset()
+        buttons = PhysicalMouseButtons(swapsRightAndMiddle: defaults.bool(forKey: PhysicalMouseButtons.swapKey))
         buttonLogs = [0, 0, 0]
         uiKitButtonLogs = 0
         let epoch = inputEpoch
@@ -230,7 +231,9 @@ final class HardwareMouse: ObservableObject {
             self.mice.removeAll { $0 === mouse }
         })
         observers.append(NotificationCenter.default.addObserver(forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main) { note in
-            let locked = (note.object as? UIScene)?.pointerLockState?.isLocked ?? false
+            // The scene comes in the user info: the notification's object isn't it.
+            let scene = note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene
+            let locked = scene?.pointerLockState?.isLocked ?? false
             HengeLog.log("input", "pointer lock: \(locked ? "on" : "off")")
         })
         PointerLock.set(true)
@@ -266,6 +269,7 @@ final class HardwareMouse: ObservableObject {
     func releaseButtons() {
         for button in buttonsDown { henge_vm_mouse_button(button, 0) }
         buttonsDown.removeAll()
+        _ = buttons.releaseAll()
         secondaryClick.reset()
     }
 
@@ -318,12 +322,13 @@ final class HardwareMouse: ObservableObject {
             buttonLogs[Int(button)] += 1
             HengeLog.log("input", "mouse button raw: controller \(device) button \(button) \(pressed ? "down" : "up")")
         }
-        if button == 1 {
+        guard let guestButton = buttons.event(button, pressed: pressed) else { return }
+        if guestButton == 1 {
             for down in secondaryClick.controller(pressed: pressed, now: ProcessInfo.processInfo.systemUptime) {
-                sendButton(button, down, source: "controller")
+                sendButton(guestButton, down, source: "controller")
             }
         } else {
-            sendButton(button, pressed, source: "controller")
+            sendButton(guestButton, pressed, source: "controller")
         }
     }
 
@@ -350,6 +355,8 @@ final class HardwareMouse: ObservableObject {
             buttonsDown.remove(button)
             StickyKeys.shared.releaseAll()
         }
+        henge_vm_mouse_button(guestButton, pressed ? 1 : 0)
+        if !pressed { StickyKeys.shared.releaseAll() }
     }
 
     private func recordButton(_ button: Int32, _ pressed: Bool, source: String, stage: String) {

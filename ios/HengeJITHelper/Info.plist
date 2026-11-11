@@ -17,9 +17,13 @@
 	<key>CFBundlePackageType</key>
 	<string>XPC!</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.2.2</string>
+	<string>0.3.1</string>
 	<key>CFBundleVersion</key>
-	<string>102</string>
+	<string>103</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_remotepairing._tcp</string>
+	</array>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionAttributes</key>
@@ -36,6 +40,8 @@
 		<key>NSExtensionPrincipalClass</key>
 		<string>HengeJITHelperHandler</string>
 	</dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Henge's JIT helper looks up the port this device's pairing service listens on.</string>
 	<key>XPCService</key>
 	<dict>
 		<key>ServiceType</key>

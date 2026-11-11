@@ -9,11 +9,31 @@ struct SettingsView: View {
     @AppStorage("henge.performanceDiagnostics") private var performanceDiagnostics = false
     @AppStorage("henge.nativeImages") private var nativeImages = true
     @AppStorage(HardwareKeys.alternateCommandKey) private var alternateCommand = false
+    @AppStorage(VolumeClicks.inputModeKey) private var inputMode = VolumeClicks.InputMode.touchscreen
+    @AppStorage(VolumeClicks.modeKey) private var volumeMode = VolumeClicks.Mode.delayHold
+    @AppStorage(VolumeClicks.swapKey) private var swapButtons = false
+    @AppStorage(PhysicalMouseButtons.swapKey) private var swapMouseButtons = false
     @AppStorage(EngineTuning.refreshKey) private var refreshRate = 60
     @AppStorage(EngineTuning.fastFlushKey) private var fastFlush = true
     @AppStorage(EngineTuning.wfiSpinKey) private var wfiSpin = false
     @AppStorage(EngineTuning.superblocksKey) private var superblocks = false
     @AppStorage(JITBootstrap.codeCacheKey) private var codeCacheMB = JITBootstrap.defaultCodeCacheMB
+    @AppStorage(DeskAppearance.key) private var appearance = DeskAppearance.system
+
+    /// The second footer paragraph: how you click, given the selected input mode.
+    private var inputDescription: String {
+        if inputMode == .touchscreen {
+            return "Tap to click once. Tap then hold to begin dragging. Quickly tap with two fingers to right-click."
+        }
+        switch volumeMode {
+        case .delayHold:
+            return "Delay hold waits to see if you're holding or just clicking the volume button, which results in all clicks being ~0.5s long."
+        case .tapThenDrag:
+            return "Tap then drag waits to see if you're holding or just clicking the volume button, but it unconditionally sends a single click regardless of whether you tap or hold, which results in shorter clicks at the cost of sending a click before holding."
+        case .intercept:
+            return "Activates the camera in order to intercept volume keys properly. This causes the volume keys to behave in the same way a mouse's buttons do, but it causes higher temperatures, as the camera is always on."
+        }
+    }
 
     var body: some View {
         NavigationStack {
@@ -62,7 +82,31 @@ struct SettingsView: View {
                             Slider(value: $scrollSpeed, in: 0.1...1.5)
                         }
                         MouseScrollSettings()
+                        Toggle("Swap physical right and middle buttons", isOn: $swapMouseButtons)
+                        Text("Only enable this if your physical mouse's right and middle buttons are reversed in the Mac. Touch controls stay unchanged. Restart the Mac session to apply.")
+                            .font(.footnote).foregroundStyle(.secondary)
                         Text("A Magic Keyboard or a Bluetooth mouse moves the Mac's pointer. Pointer speed changes apply the next time a Mac starts; scroll speed changes apply immediately.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                    .listRowBackground(Desk.card)
+                }
+                if !Device.isPad {
+                    Section("Trackpad") {
+                        Picker("Input mode", selection: $inputMode) {
+                            Text("Touchscreen").tag(VolumeClicks.InputMode.touchscreen)
+                            Text("Volume buttons").tag(VolumeClicks.InputMode.volumeButtons)
+                        }
+                        .pickerStyle(.menu)
+                        if inputMode == .volumeButtons {
+                            Picker("Button mode", selection: $volumeMode) {
+                                Text("Delay hold").tag(VolumeClicks.Mode.delayHold)
+                                Text("Tap then drag").tag(VolumeClicks.Mode.tapThenDrag)
+                                Text("Camera intercept").tag(VolumeClicks.Mode.intercept)
+                            }
+                            .pickerStyle(.menu)
+                            Toggle("Swap buttons", isOn: $swapButtons)
+                        }
+                        Text("Henge is able to emulate a Magic Trackpad, allowing you to perform native macOS gestures using your device's touchscreen.\n\n\(inputDescription)")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                     .listRowBackground(Desk.card)
@@ -86,7 +130,16 @@ struct SettingsView: View {
                     }
                     Text("The default is 1 GB. A 1.5 GB code cache empties less often but uses more memory, including extra translation records. Applies the next time Henge opens. If JIT stops turning on, choose 1 GB.")
                         .font(.footnote).foregroundStyle(.secondary)
-                    Text("60 Hz leaves more of the emulated CPU to apps. Faster disk writes order them without waiting for a full sync; a sudden power loss could lose the last ones. Quicker wake keeps an idle CPU watching for work for 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
+                    Text("macOS draws a frame for every refresh: 30 Hz leaves the most of the emulated CPU to apps, at the cost of choppier animation; 60 Hz is smoother. Faster disk writes order them without waiting for a full sync; a sudden power loss could lose the last ones. Quicker wake keeps an idle CPU watching for work for 50 µs, at some battery cost. Superblocks let translated code run past conditional branches. Changes apply the next time a Mac starts.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .listRowBackground(Desk.card)
+                Section("Appearance") {
+                    Picker("Appearance", selection: $appearance) {
+                        ForEach(DeskAppearance.allCases) { Text($0.title).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    Text("System follows the \(Device.name)'s Light or Dark setting. Henge stays dark while a Mac is running.")
                         .font(.footnote).foregroundStyle(.secondary)
                     Text("For long sessions, try 30 Hz with the Mac's Low load screen setting. Motion will be less smooth than 60 Hz. This reduces the requested refresh rate; it cannot override iPadOS thermal dimming.")
                         .font(.footnote).foregroundStyle(.secondary)
