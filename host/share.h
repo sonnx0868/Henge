@@ -12,6 +12,9 @@ int hv_share_start(const char *folder, const char *socket_path, const char *agen
 typedef int (*HvShareImageProcessor)(const uint8_t *, size_t, int, int, int, uint8_t **, size_t *);
 /* Optional host-native image service, reachable only through the guest's sharing socket. */
 void hv_share_set_image_processor(HvShareImageProcessor processor);
+/* Stop the share server and unlink its socket. hv_share_start after this, or with a different
+   folder, serves the new root: the pair is the resume/repair path (see share.c). */
+void hv_share_stop(void);
 
 /* The device's clipboard, for the guest to pick up. */
 void hv_share_set_clipboard(const char *text);
