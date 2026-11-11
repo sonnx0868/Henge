@@ -22,6 +22,7 @@ int hv_machine_add_mmio(HvMachine *m, uint64_t pa, uint64_t size, void *opaque,
 void hv_gicv3_pend(HvGic *g, int irq) { (void)g; (void)irq; interrupts++; }
 void hv_machine_wake(HvMachine *m) { (void)m; }
 HvPvgMetal *hv_pvg_metal_create(HvPvgLite *p) { (void)p; return (HvPvgMetal *)1; }
+void hv_pvg_metal_destroy(HvPvgMetal *m) { (void)m; }
 void hv_pvg_metal_set_layer(HvPvgMetal *m, void *l) { (void)m; (void)l; }
 uint64_t hv_pvg_metal_gpu_frames(HvPvgMetal *m) { (void)m; return submitted; }
 int hv_pvg_metal_snapshot(HvPvgMetal *m, uint8_t *p, uint32_t w, uint32_t h) {

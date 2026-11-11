@@ -17,8 +17,10 @@ struct Trackpad: UIViewRepresentable {
     /// Four fingers tapped together: the session shows its hidden controls.
     static let revealTap = Notification.Name("henge.trackpad.revealTap")
 
+    @AppStorage(ScrollSensitivity.key) private var scrollSpeed = ScrollSensitivity.defaultValue
+
     func makeUIView(context: Context) -> Surface { Surface() }
-    func updateUIView(_ view: Surface, context: Context) {}
+    func updateUIView(_ view: Surface, context: Context) { view.scrollSpeed = scrollSpeed }
 
     final class Surface: UIView, UIPointerInteractionDelegate, UIGestureRecognizerDelegate, UIContextMenuInteractionDelegate {
         /// The emulated pad's sensor, in the Magic Trackpad 2's own units.
@@ -28,8 +30,14 @@ struct Trackpad: UIViewRepresentable {
         private static let tapTime: TimeInterval = 0.3
         private static let tapDistance: CGFloat = 8
 
-        private struct Finger { var touch: UITouch; var id: Int32 }
+        private struct Finger {
+            var touch: UITouch
+            var id: Int32
+            var position: CGPoint
+        }
 
+        var scrollSpeed = ScrollSensitivity.defaultValue
+        private var scroll = TwoFingerScroll()
         private var fingers: [Finger] = []
         private var freeIds = Set<Int32>(1...5) /* a touch screen reports five fingers at most */
         private var started = Date()
@@ -85,7 +93,7 @@ struct Trackpad: UIViewRepresentable {
         func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                                shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool { true }
         /// Where the finger is on the pad's sensor, in its units.
-        private func sensor(_ t: UITouch) -> (Int32, Int32) {
+        private func sensor(_ t: UITouch) -> CGPoint {
             let p = t.location(in: self)
             // One scale for both axes. The view and the pad's sensor are different
             // shapes, so stretching the view to fill the sensor would make a finger
@@ -95,8 +103,15 @@ struct Trackpad: UIViewRepresentable {
             let scale = min(Double(Self.sensorW) / w, Double(Self.sensorH) / h)
             let x = (Double(p.x) - w / 2) * scale + Double(Self.sensorW) / 2
             let y = (Double(p.y) - h / 2) * scale + Double(Self.sensorH) / 2
-            return (Int32(min(max(x, 0), Double(Self.sensorW))),
-                    Int32(min(max(y, 0), Double(Self.sensorH))))
+            return CGPoint(x: min(max(x, 0), Double(Self.sensorW)),
+                           y: min(max(y, 0), Double(Self.sensorH)))
+        }
+
+        private func report(_ finger: Finger, phase: Int32, timestamp: UInt32) {
+            let point = scroll.position(for: finger.position)
+            let x = Int32(min(max(point.x, 0), CGFloat(Self.sensorW)))
+            let y = Int32(min(max(point.y, 0), CGFloat(Self.sensorH)))
+            henge_vm_touch(finger.id, phase, x, y, timestamp)
         }
 
         /* A touch sample's own clock, in ms. The guest derives finger speed from the
@@ -112,17 +127,18 @@ struct Trackpad: UIViewRepresentable {
                 started = Date()
                 travelled = 0
                 mostFingers = 0
+                scroll = TwoFingerScroll()
                 if tapsClick { buzz.prepare() }
             }
             for t in touches {
                 guard let id = freeIds.min() else { break }
                 freeIds.remove(id)
-                fingers.append(Finger(touch: t, id: id))
-                let (x, y) = sensor(t)
-                henge_vm_touch(id, 0, x, y, Self.ms(t.timestamp))
+                let finger = Finger(touch: t, id: id, position: sensor(t))
+                fingers.append(finger)
+                report(finger, phase: 0, timestamp: Self.ms(t.timestamp))
                 if touchesLogged < 12 {
                     touchesLogged += 1
-                    HengeLog.log("input", "trackpad: finger \(id) down at \(x),\(y)")
+                    HengeLog.log("input", "trackpad: finger \(id) down at \(Int(finger.position.x)),\(Int(finger.position.y))")
                 }
             }
             mostFingers = max(mostFingers, fingers.count)
@@ -139,21 +155,32 @@ struct Trackpad: UIViewRepresentable {
         }
 
         override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-            var moved = false
+            var moved: [Int] = []
+            var combinedMovement = CGPoint.zero
             let ts = Self.ms(event?.timestamp ?? touches.first?.timestamp ?? 0)
             for t in touches where t.type != .indirectPointer {
                 guard let i = fingers.firstIndex(where: { $0.touch == t }) else { continue }
                 let now = t.location(in: self), before = t.previousLocation(in: self)
                 travelled += abs(now.x - before.x) + abs(now.y - before.y)
-                let (x, y) = sensor(t)
-                henge_vm_touch(fingers[i].id, 1, x, y, ts)
-                moved = true
+                let position = sensor(t)
+                combinedMovement.x += position.x - fingers[i].position.x
+                combinedMovement.y += position.y - fingers[i].position.y
+                fingers[i].position = position
+                moved.append(i)
+            }
+            guard !moved.isEmpty else { return }
+            if fingers.count == 2 {
+                scroll.apply(combinedMovement: combinedMovement, sensitivity: scrollSpeed)
+                // Both positions include the same correction, even if only one touch changed.
+                for finger in fingers { report(finger, phase: 1, timestamp: ts) }
+            } else {
+                for i in moved { report(fingers[i], phase: 1, timestamp: ts) }
             }
             /* Moving means pointing or a gesture, not a tap or a press-to-drag. */
             if tapsClick && travelled >= Self.tapDistance && !holding { cancelHold() }
             /* One frame with every finger that moved, so the guest sees a gesture's
                fingers move together rather than one at a time. */
-            if moved { henge_vm_touch_frame(ts) }
+            henge_vm_touch_frame(ts)
         }
 
         override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) { lift(touches) }

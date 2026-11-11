@@ -17,6 +17,7 @@ struct HardwareShortcutTests {
     }
 
     static func main() {
+        checkOptionOwnership()
         checkSettingsMigration()
         var keys = HardwareShortcutMapper()
         check(keys.event(control, down: true, enabled: noShortcuts.contains), [key(control, true)], "disabled control")
@@ -106,6 +107,28 @@ struct HardwareShortcutTests {
         _ = keys.releaseAll()
 
         print("PASS: hardware shortcut mapping and release handling")
+    }
+
+    static func checkOptionOwnership() {
+        let option: UInt8 = 0xe6
+        var keys = HardwareShortcutMapper()
+        check(keys.event(option, down: true, rightOptionIsCommand: true, enabled: allShortcuts.contains),
+              [key(command, true)], "mapped option owns Command")
+        check(keys.event(command, down: true, enabled: allShortcuts.contains), [], "real Command shares ownership")
+        check(keys.event(option, down: false, rightOptionIsCommand: false, enabled: allShortcuts.contains), [], "preference change preserves real Command")
+        check(keys.event(command, down: false, enabled: allShortcuts.contains), [key(command, false)], "last owner releases Command")
+        _ = keys.event(option, down: true, rightOptionIsCommand: true, enabled: allShortcuts.contains)
+        _ = keys.event(command, down: true, enabled: allShortcuts.contains)
+        check(keys.event(command, down: false, enabled: allShortcuts.contains), [], "physical release keeps mapped Command")
+        check(keys.event(option, down: false, enabled: allShortcuts.contains), [key(command, false)], "mapped release uses press-time preference")
+        _ = keys.event(option, down: true, enabled: allShortcuts.contains)
+        check(keys.event(option, down: false, rightOptionIsCommand: true, enabled: allShortcuts.contains),
+              [key(option, false)], "unmapped press releases original Option despite preference change")
+        _ = keys.event(control, down: true, enabled: allShortcuts.contains)
+        _ = keys.event(tab, down: true, enabled: allShortcuts.contains)
+        check(keys.event(option, down: true, rightOptionIsCommand: true, enabled: allShortcuts.contains), [], "option joins shortcut Command")
+        check(keys.event(control, down: false, enabled: allShortcuts.contains), [], "ending shortcut preserves option Command")
+        check(keys.releaseAll(), [key(tab, false), key(command, false)], "focus loss releases shared Command once")
     }
 
     static func checkSettingsMigration() {

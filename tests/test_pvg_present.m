@@ -45,6 +45,7 @@ void hv_pvg_lite_complete(HvPvgLite *p, uint32_t c, uint32_t s) { stamps++; }
 @property(nonatomic, strong) NSMutableArray *handlers;
 @property(nonatomic, strong) NSError *error;
 @property MTLCommandBufferStatus status;
+@property CFTimeInterval GPUStartTime, GPUEndTime;
 @end
 @implementation TestCB
 - (instancetype)init { if ((self = [super init])) _handlers = [NSMutableArray new]; return self; }
@@ -93,6 +94,7 @@ int main(void) {
         TestReplay *r = [TestReplay new];
         TestQueue *q = [TestQueue new];
         r->queue = (id<MTLCommandQueue>)q;
+        r->completions = dispatch_group_create();
         r->presenter = dispatch_queue_create("test.present", DISPATCH_QUEUE_SERIAL);
         r->screen_lock = OS_UNFAIR_LOCK_INIT;
         r->layer = [CAMetalLayer layer]; // the production presenter now requires an attached layer

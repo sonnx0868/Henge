@@ -20,22 +20,7 @@ fi
 
 # Exercise guest code changes and cache invalidation on the Mac build host before packaging iOS.
 cd "$HENGE_ROOT"
-# The native-vs-JIT harness keeps multi-megabyte HvCpu copies on the main stack.
-ulimit -s 65520
-make build/test_code_links build/test_jit build/test_mem build/test_mmu build/test_scroll_bridge build/test_jit_script build/test_scroll_pixels build/test_pvg_video_layout build/test_pvg_present build/test_pvg_queue build/test_native_image build/test_image_bridge
-swiftc -parse-as-library ios/Henge/ScrollMotion.swift tests/test_scroll_motion.swift -o build/test_scroll_motion
-swiftc -parse-as-library ios/Henge/SecondaryClickRouting.swift tests/test_secondary_click.swift -o build/test_secondary_click
-swiftc -parse-as-library ios/Henge/HardwareKeyRouting.swift tests/test_hardware_keys.swift -o build/test_hardware_keys
-for test in test_code_links test_jit test_mem test_mmu test_scroll_bridge test_scroll_motion test_jit_script test_scroll_pixels test_pvg_video_layout test_pvg_present test_pvg_queue test_secondary_click test_hardware_keys test_native_image test_image_bridge; do
-    printf 'Running %s\n' "$test"
-    if "build/$test"; then
-        continue
-    else
-        result=$?
-        lldb --batch -o run -o 'thread backtrace all' -- "build/$test" || true
-        exit "$result"
-    fi
-done
+bash ci/check-integration.sh
 
 missing=()
 for tool in meson ninja pkg-config xcodegen cmake; do

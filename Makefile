@@ -111,7 +111,7 @@ $(B)/test_shutdown: tests/test_shutdown.c $(ENGINE)
 $(B)/test_dns_lifecycle: tests/test_dns_lifecycle.c $(B)/dns_proxy.o
 	$(CC) $(CFLAGS) $^ -o $@
 
-$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/usb_host.o
+$(B)/test_vm_lifecycle: tests/test_vm_lifecycle.c ios/Henge/Native/henge-vm.c $(ENGINE) $(DEV) $(B)/vm.o $(B)/audio_mac.o $(B)/net_slirp.o $(B)/dns_proxy.o $(B)/share.o $(B)/usb_host.o $(B)/image_service.o
 	$(CC) $(CFLAGS) -Iios/Henge/Native $^ $(SLIRP_LIBS) $(METAL_LIBS) -framework AudioToolbox -o $@
 
 test-vm-lifecycle: $(B)/test_vm_lifecycle
@@ -243,3 +243,6 @@ $(B)/test_hardware_shortcuts: ios/Henge/HardwareShortcutMapper.swift tests/test_
 test-hardware-shortcuts: $(B)/test_hardware_shortcuts
 	$(B)/test_hardware_shortcuts
 .PHONY: test-hardware-shortcuts
+
+$(B)/image_service.o: host/image_service.m host/image_service.h host/image_ops.h | $(B)
+	$(CC) $(CFLAGS) -fobjc-arc -c $< -o $@

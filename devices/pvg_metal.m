@@ -1153,20 +1153,27 @@ static BOOL has_guest_pages(HvObject *o) {
 }
 
 /* Between guest memory and the GPU's own copy, in the layout the guest was told. */
-- (void)page:(HvObject *)o toGuest:(BOOL)down task:(uint32_t)task blit:(id<MTLBlitCommandEncoder> *)blit commandBuffer:(id<MTLCommandBuffer>)cb {
+- (BOOL)page:(HvObject *)o toGuest:(BOOL)down task:(uint32_t)task blit:(id<MTLBlitCommandEncoder> *)blit commandBuffer:(id<MTLCommandBuffer>)cb {
     id<MTLBuffer> copy = guest_copy(self, task, o);
-    if (!copy || !has_guest_pages(o)) return;
+    if (!copy || !has_guest_pages(o)) return NO;
+    if (!down) {
+        uint64_t count = (o->length + 0x3fff) >> 14;
+        for (uint64_t i = 0; i < count; i++)
+            if (!o->pages || !o->pages[i]) return NO;
+    }
     if (o->heap_whole) {
-        if (!*blit) *blit = [cb blitCommandEncoder];
         NSUInteger bytes = MIN(copy.length, o->heap_whole.length);
+        if (!bytes || bytes < o->length) return NO;
+        if (!*blit) *blit = [cb blitCommandEncoder];
+        if (!*blit) return NO;
         if (down) [*blit copyFromBuffer:o->heap_whole sourceOffset:0 toBuffer:copy destinationOffset:0 size:bytes];
         else [*blit copyFromBuffer:copy sourceOffset:0 toBuffer:o->heap_whole destinationOffset:0 size:bytes];
-        return;
+        return YES;
     }
     id<MTLTexture> tex = o->object;
-    if (!tex || !o->tex_layout || tex.sampleCount > 1 || tex.isFramebufferOnly) return;
+    if (!tex || !o->tex_layout || tex.sampleCount > 1 || tex.isFramebufferOnly) return NO;
     NSUInteger faces = tex.textureType == MTLTextureTypeCube || tex.textureType == MTLTextureTypeCubeArray ? 6 : 1;
-    if (!*blit) *blit = [cb blitCommandEncoder];
+    BOOL copied = NO, complete = YES;
     for (uint32_t s = 0; s < o->tex_slices * faces; s++)
         for (uint32_t m = 0; m < o->tex_mips; m++) {
             const uint8_t *mip = o->tex_layout + m * 36;
@@ -1176,7 +1183,11 @@ static BOOL has_guest_pages(HvObject *o) {
             uint32_t bh = o->tex_block_h ? o->tex_block_h : 1;
             uint64_t from = o->tex_base + o->tex_stride * s + off;
             uint64_t image = row * ((h + bh - 1) / bh);
-            if (from + image * d > o->length) continue;
+            if (!w || !h || !d || !row || from > o->length ||
+                image > (o->length - from) / d) { complete = NO; continue; }
+            if (!*blit) *blit = [cb blitCommandEncoder];
+            if (!*blit) return NO;
+            copied = YES;
             if (down)
                 [*blit copyFromTexture:tex sourceSlice:s sourceLevel:m sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(w, h, d)
                               toBuffer:copy destinationOffset:from destinationBytesPerRow:row destinationBytesPerImage:image];
@@ -1184,6 +1195,7 @@ static BOOL has_guest_pages(HvObject *o) {
                 [*blit copyFromBuffer:copy sourceOffset:from sourceBytesPerRow:row sourceBytesPerImage:image
                            sourceSize:MTLSizeMake(w, h, d) toTexture:tex destinationSlice:s destinationLevel:m destinationOrigin:MTLOriginMake(0, 0, 0)];
         }
+    return copied && complete;
 }
 
 /* The guest asks to see what the GPU made: {task, count, refs}. */
@@ -1198,8 +1210,8 @@ static BOOL has_guest_pages(HvObject *o) {
         HvObject *o = objs[@(a[2 + i])];
         if (!o || !o->guest_backed || !o->host_valid) continue;
         if (!cb) cb = [queue commandBuffer];
-        [self page:o toGuest:YES task:task blit:&blit commandBuffer:cb];
-        o->guest_stale = NO;
+        if ([self page:o toGuest:YES task:task blit:&blit commandBuffer:cb])
+            o->guest_stale = NO;
     }
     [blit endEncoding];
     if (cb) {
@@ -2128,6 +2140,14 @@ typedef struct {
     for (uint32_t i = 0; i < nres; i++) {
         HvObject *o = [self object:res[i * 2] task:task];
         if (!o) continue;
+        if (res[i * 2 + 1] & 2) {
+            os_unfair_lock_lock(&screen_lock);
+            id<MTLTexture> visible = screen_tex;
+            os_unfair_lock_unlock(&screen_lock);
+            if (visible) for (HvObject *owner = o; owner; owner = owner->parent)
+                if (owner->scanout == visible || (owner->surface && owner->surface->scanout == visible))
+                    writes_visible = YES;
+        }
         if (o->mapped) refresh_pages(self, task, o);
         HvObject *surface = o->surface;
         if (surface && surface->iosurface) {
@@ -2144,8 +2164,8 @@ typedef struct {
         }
         if (res[i * 2 + 1] & 1) o->guest_stale = NO, o->host_valid = NO; /* the guest wrote it */
         if (o->guest_backed && !o->host_valid) {
-            if (!o->guest_stale) [self page:o toGuest:NO task:task blit:&blit commandBuffer:cb];
-            o->host_valid = YES;
+            if (!o->guest_stale && [self page:o toGuest:NO task:task blit:&blit commandBuffer:cb])
+                o->host_valid = YES;
         }
         if (res[i * 2 + 1] & 4) sync_after = YES;
     }
@@ -2229,8 +2249,8 @@ typedef struct {
             if (!(res[i * 2 + 1] & 4)) continue;
             HvObject *o = [self object:res[i * 2] task:task];
             if (!o || !o->guest_backed) continue;
-            [self page:o toGuest:YES task:task blit:&back commandBuffer:cb];
-            o->guest_stale = NO;
+            if ([self page:o toGuest:YES task:task blit:&back commandBuffer:cb])
+                o->guest_stale = NO;
         }
         [back endEncoding];
     }
