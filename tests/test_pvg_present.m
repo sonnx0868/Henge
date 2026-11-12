@@ -17,6 +17,8 @@ uint64_t hv_pvg_lite_task_objects(HvPvgLite *p, uint32_t t) { abort(); }
 const uint8_t *hv_pvg_lite_surface(HvPvgLite *p, uint32_t n) { abort(); }
 uint8_t *hv_pvg_lite_display_page(HvPvgLite *p) { abort(); }
 void hv_pvg_lite_command(HvPvgLite *p, const uint32_t *c, uint32_t n) { abort(); }
+int hv_pvg_trace_on(void) { return 0; }
+int hv_pvg_lite_old_driver(HvPvgLite *p) { (void)p; return 0; }
 static unsigned stamps;
 void hv_pvg_lite_complete(HvPvgLite *p, uint32_t c, uint32_t s) { stamps++; }
 
