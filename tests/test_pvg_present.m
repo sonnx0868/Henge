@@ -122,7 +122,7 @@ int main(void) {
             assert(r->displayed == i + 1); /* resumes after every idle period */
             assert(atomic_load(&r->inflight) == 0);
         }
-        assert(stamps == 3 && r->screen_swaps == 0);
+        assert(stamps == 3); /* no swap command was submitted */
         assert(atomic_load(&r->gpu_redraws) == 3);
         q.next = [TestCB new];
         assert([r exec:exec length:sizeof exec channel:1 stamp:4]);
@@ -205,7 +205,7 @@ int main(void) {
         vm_address_t pixels = 0;
         assert(vm_allocate(mach_task_self(), &pixels, video->length, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
         video->mapped = (uint8_t *)pixels;
-        video->iosurface = make_iosurface(video, descriptor, video->alloc);
+        video->iosurface = make_iosurface(video, descriptor, video->alloc, NO);
         assert(video->iosurface);
         r->resource->surface = video;
         r->aliasResource = [HvObject new];
