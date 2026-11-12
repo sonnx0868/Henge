@@ -1162,8 +1162,9 @@ static BOOL has_guest_pages(HvObject *o) {
             if (!o->pages || !o->pages[i]) return NO;
     }
     if (o->heap_whole) {
-        NSUInteger bytes = MIN(copy.length, o->heap_whole.length);
-        if (!bytes || bytes < o->length) return NO;
+        /* Guest mappings round up to 16 KB; only the heap's actual bytes need copying. */
+        NSUInteger bytes = o->heap_whole.length;
+        if (!bytes || copy.length < bytes) return NO;
         if (!*blit) *blit = [cb blitCommandEncoder];
         if (!*blit) return NO;
         if (down) [*blit copyFromBuffer:o->heap_whole sourceOffset:0 toBuffer:copy destinationOffset:0 size:bytes];
