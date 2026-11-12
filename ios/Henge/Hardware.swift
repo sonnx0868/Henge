@@ -190,6 +190,7 @@ final class HardwareMouse: ObservableObject {
     private var observers: [NSObjectProtocol] = []
     private var mice: [GCMouse] = []
     private var buttons = PhysicalMouseButtons(swapsRightAndMiddle: false)
+    private var buttonsDown: Set<Int32> = []
     private var restX: Float = 0, restY: Float = 0
     private var speed: Float = 1
     private var reverse = false
@@ -286,13 +287,22 @@ final class HardwareMouse: ObservableObject {
         scrollStates[id] = ScrollState(kind: scrollKind(for: device))
         input.mouseMovedHandler = { [weak self] _, dx, dy in self?.moved(dx, dy) }
         input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
-            DispatchQueue.main.async { self?.button(0, pressed, device: name) }
+            DispatchQueue.main.async {
+                guard let self, self.running, self.inputEpoch == epoch else { return }
+                self.button(0, pressed, device: name)
+            }
         }
         input.rightButton?.pressedChangedHandler = { [weak self] _, _, pressed in
-            DispatchQueue.main.async { self?.button(1, pressed, device: name) }
+            DispatchQueue.main.async {
+                guard let self, self.running, self.inputEpoch == epoch else { return }
+                self.button(1, pressed, device: name)
+            }
         }
         input.middleButton?.pressedChangedHandler = { [weak self] _, _, pressed in
-            DispatchQueue.main.async { self?.button(2, pressed, device: name) }
+            DispatchQueue.main.async {
+                guard let self, self.running, self.inputEpoch == epoch else { return }
+                self.button(2, pressed, device: name)
+            }
         }
         input.scroll.valueChangedHandler = nil
         // Each axis reports its own relative events. Comparing values to the
@@ -356,8 +366,6 @@ final class HardwareMouse: ObservableObject {
             buttonsDown.remove(button)
             StickyKeys.shared.releaseAll()
         }
-        henge_vm_mouse_button(guestButton, pressed ? 1 : 0)
-        if !pressed { StickyKeys.shared.releaseAll() }
     }
 
     private func recordButton(_ button: Int32, _ pressed: Bool, source: String, stage: String) {
